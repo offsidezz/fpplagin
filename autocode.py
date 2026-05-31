@@ -18,7 +18,7 @@ import re
 import signal
 import time
 import uuid as uuid_lib
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from threading import Thread, Timer, Lock
@@ -34,11 +34,11 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.2.2"
+VERSION = "5.2.3"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
-    "v5.2.2: фикс TypeError в статистике, быстрая навигация по страницам аренд.\n"
+    "v5.2.3: кнопка проверки всех почт, умное определение языка, надёжная рассылка.\n"
     "Управление: /autocode"
 )
 CREDITS = "@offsidezq"
@@ -47,7 +47,7 @@ BIND_TO_DELETE = None
 
 logger = logging.getLogger("FPC.AutoCode")
 
-# ── Callback constants ──────────────────────────────────────────────────────
+# ── Callback constants ──
 AC_MAIN          = "ac_main"
 AC_LIST          = "ac_list"
 AC_ADD           = "ac_add"
@@ -95,8 +95,9 @@ AC_REVIEW        = "ac_review"
 AC_WINBACK       = "ac_winback"
 AC_WB_RUN        = "ac_wb_run"
 AC_WB_TPL        = "ac_wb_tpl"
+AC_CHECK_ALL     = "ac_check_all"
 
-# ── Storage paths ───────────────────────────────────────────────────────────
+# ── Storage paths ──
 DATA_DIR        = "storage/autocode"
 BACKUP_DIR      = os.path.join(DATA_DIR, "backups")
 ACCOUNTS_FILE   = os.path.join(DATA_DIR, "accounts.json")
@@ -109,6 +110,7 @@ WARNED_FILE     = os.path.join(DATA_DIR, "warned_state.json")
 HEALTH_FILE     = os.path.join(DATA_DIR, "imap_health.json")
 WINBACK_FILE    = os.path.join(DATA_DIR, "winback_sent.json")
 SETTINGS_FILE   = os.path.join(DATA_DIR, "settings.json")
+LANG_CACHE_FILE = os.path.join(DATA_DIR, "lang_cache.json")
 
 ENCRYPTED_FILES = {RENTALS_FILE, USED_FILE, ACCOUNTS_FILE}
 
@@ -141,6 +143,15 @@ REVIEW_DELAY_SEC      = 30 * 60
 WINBACK_AFTER_DAYS    = 3
 WINBACK_MAX_DAYS      = 30
 RENTALS_PAGE_SIZE     = 8
+BROADCAST_COOLDOWN_SEC = 3
+BROADCAST_RETRY_MAX    = 3
+
+# Commands that must NOT influence language detection
+COMMAND_MESSAGES = {
+    "!cd", "cd", "code", "!code", "код", "!код",
+    "!time", "time", "!время", "время",
+    "!help", "help", "помощь", "!помощь",
+}
 
 _SECRET_KEY = (os.environ.get("AC_SECRET") or "ac_fp_secret_2025").encode()
 _ENC_MARKER = "ACENC1:"
@@ -211,7 +222,6 @@ def _save(path, data):
         logger.error(f"AutoCode: не удалось сохранить {path}: {e}")
 
 def _safe_ts(value) -> float:
-    """Robust float conversion: handles int, float, ISO strings, dd.mm.YYYY, garbage."""
     if value is None:
         return 0.0
     if isinstance(value, (int, float)):
@@ -256,6 +266,8 @@ def health_state():        return _load(HEALTH_FILE, {})
 def save_health(d):        _save(HEALTH_FILE, d)
 def winback_sent():        return _load(WINBACK_FILE, {})
 def save_winback(d):       _save(WINBACK_FILE, d)
+def lang_cache():          return _load(LANG_CACHE_FILE, {})
+def save_lang_cache(d):    _save(LANG_CACHE_FILE, d)
 def app_settings():        return _load(SETTINGS_FILE, {
     "review_enabled":   True,
     "review_template":  "Если код подошёл — буду благодарен за отзыв 🙏 Это очень помогает!",
@@ -265,6 +277,26 @@ def app_settings():        return _load(SETTINGS_FILE, {
     "queue_pause_sec":  2,
 })
 def save_settings(d):      _save(SETTINGS_FILE, d)
+
+# In-memory lang cache (fast access), backed by file
+_lang_cache_mem: dict[str, str] = {}
+_lang_cache_lock = Lock()
+
+def _load_lang_cache():
+    global _lang_cache_mem
+    _lang_cache_mem = lang_cache() or {}
+
+def _set_buyer_lang(buyer: str, lang: str):
+    if not buyer or lang not in ("ru", "en"):
+        return
+    with _lang_cache_lock:
+        if _lang_cache_mem.get(buyer) == lang:
+            return
+        _lang_cache_mem[buyer] = lang
+        try:
+            save_lang_cache(dict(_lang_cache_mem))
+        except Exception:
+            pass
 
 def add_log(email_addr, lot_id, buyer, code, chat_id=None):
     entries = log_entries()
@@ -302,13 +334,55 @@ def detect_imap_host(email_addr: str) -> str:
     return IMAP_HOSTS.get(domain, f"imap.{domain}")
 
 _RU_RE = re.compile(r"[а-яА-ЯёЁ]")
+_EN_RE = re.compile(r"[a-zA-Z]")
 
-def detect_lang(text: str) -> str:
+def detect_lang(text: str) -> str | None:
+    """Return 'ru', 'en', or None if no meaningful letters."""
     if not text:
-        return "ru"
+        return None
     ru_chars = len(_RU_RE.findall(text))
-    total    = max(1, len(re.findall(r"[a-zA-Zа-яА-ЯёЁ]", text)))
-    return "ru" if (ru_chars / total) >= 0.3 else "en"
+    en_chars = len(_EN_RE.findall(text))
+    total = ru_chars + en_chars
+    if total < 2:
+        return None
+    if ru_chars >= en_chars:
+        return "ru"
+    return "en"
+
+def _is_command_message(text: str) -> bool:
+    if not text:
+        return False
+    return text.strip().lower() in COMMAND_MESSAGES
+
+def get_buyer_lang(buyer: str, current_text: str = "") -> str:
+    """
+    Determine buyer language.
+    Priority:
+      1. Cached lang from prior FREEFORM (non-command) messages by this buyer
+      2. Lang of current message (only if it's freeform / not a command)
+      3. Lang from any rental record for this buyer
+      4. Fallback: 'ru'
+    """
+    # 1. Cache
+    with _lang_cache_lock:
+        cached = _lang_cache_mem.get(buyer)
+    if cached in ("ru", "en"):
+        return cached
+
+    # 2. Current text (only if NOT a command)
+    if not _is_command_message(current_text):
+        lang = detect_lang(current_text)
+        if lang:
+            return lang
+
+    # 3. Rentals
+    rents = rentals()
+    for r in rents.values():
+        if r.get("buyer") == buyer and r.get("lang") in ("ru", "en"):
+            return r["lang"]
+
+    # 4. Default
+    return "ru"
 
 L = {
     "ru": {
@@ -354,13 +428,6 @@ def t(lang: str, key: str, **kwargs) -> str:
         except Exception:
             return text
     return text
-
-def get_buyer_lang(buyer: str, fallback_text: str = "") -> str:
-    rents = rentals()
-    for r in rents.values():
-        if r.get("buyer") == buyer and r.get("lang"):
-            return r["lang"]
-    return detect_lang(fallback_text)
 
 def _decode_str(value: str) -> str:
     parts = email.header.decode_header(value)
@@ -433,7 +500,7 @@ def _find_code(plain, html, subj, acc) -> str | None:
     m = pat.search(text)
     return m.group() if m else None
 
-def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
+def fetch_code(acc, used, not_before_ts=None, dry_run=False) -> tuple[str | None, str | None]:
     email_addr  = acc.get("email", "")
     password    = _decrypt_password(acc.get("password", ""))
     imap_host   = acc.get("imap_host") or detect_imap_host(email_addr)
@@ -443,11 +510,12 @@ def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
 
     raw_used = used.get(email_addr, [])
     used_set = set()
-    for entry in raw_used:
-        if isinstance(entry, dict):
-            used_set.add(entry.get("code", ""))
-        else:
-            used_set.add(entry)
+    if not dry_run:
+        for entry in raw_used:
+            if isinstance(entry, dict):
+                used_set.add(entry.get("code", ""))
+            else:
+                used_set.add(entry)
 
     try:
         mail = imaplib.IMAP4_SSL(imap_host, timeout=IMAP_TIMEOUT)
@@ -511,6 +579,32 @@ def test_imap(acc) -> str:
         return f"✅ Подключение успешно ({host})"
     except Exception as e:
         return f"❌ Ошибка: {e}"
+
+def full_check_account(acc) -> dict:
+    """Full check: IMAP + code fetch dry run."""
+    result = {
+        "email":      acc.get("email", "?"),
+        "imap_ok":    False,
+        "imap_msg":   "",
+        "code_ok":    False,
+        "code_msg":   "",
+        "code_found": None,
+    }
+    imap_res = test_imap(acc)
+    result["imap_ok"]  = imap_res.startswith("✅")
+    result["imap_msg"] = imap_res
+    if not result["imap_ok"]:
+        result["code_msg"] = "Пропущено — нет IMAP."
+        return result
+    code, err = fetch_code(acc, used_codes(), dry_run=True)
+    if code:
+        result["code_ok"]    = True
+        result["code_msg"]   = "Тестовый код найден"
+        result["code_found"] = code[:20] + ("…" if len(code) > 20 else "")
+    else:
+        result["code_ok"]  = False
+        result["code_msg"] = err or "Код не найден"
+    return result
 
 class IMAPQueue:
     def __init__(self):
@@ -594,7 +688,8 @@ def _record_request(buyer: str):
 
 def kb_main():
     return K(keyboard=[
-        [B("📬 Список почт",     callback_data=f"{AC_LIST}:0")],
+        [B("📬 Список почт",     callback_data=f"{AC_LIST}:0"),
+         B("🔬 Проверить все",   callback_data=AC_CHECK_ALL)],
         [B("🏠 Активные аренды", callback_data=f"{AC_RENT_PAGE}:0"),
          B("📜 Лог выдач",       callback_data=AC_LOG)],
         [B("📊 Статистика",      callback_data=AC_STATS),
@@ -713,7 +808,6 @@ def _notify_tg_rate_limit(cardinal, buyer, count):
         f"🚨 Лимит запросов\nПокупатель {buyer} сделал {count} запросов за час.")
 
 def _safe_edit(bot, call, text, kb, parse_mode=None):
-    """Безопасный edit_message_text — глушит MessageNotModified."""
     try:
         bot.edit_message_text(
             text,
@@ -742,6 +836,23 @@ def _safe_answer(bot, call, text="", show_alert=False):
         bot.answer_callback_query(call.id, text, show_alert=show_alert)
     except Exception:
         pass
+
+def _send_with_retry(cardinal, chat_id, text, chat_name="") -> tuple[bool, str]:
+    """
+    Try to send a message up to BROADCAST_RETRY_MAX times with 2s gap between retries.
+    Returns (success, last_error_str).
+    """
+    last_err = ""
+    for attempt in range(1, BROADCAST_RETRY_MAX + 1):
+        try:
+            cardinal.send_message(chat_id, text, chat_name)
+            return True, ""
+        except Exception as ex:
+            last_err = str(ex)
+            logger.warning(f"send_with_retry attempt {attempt} fail to {chat_id}: {ex}")
+            if attempt < BROADCAST_RETRY_MAX:
+                time.sleep(2)
+    return False, last_err
 
 def _startup_imap_test(cardinal):
     time.sleep(5)
@@ -1132,7 +1243,6 @@ def _expiry_watcher(cardinal):
                         args=(cid, t(lang, "warn_4h", h=WARN_BEFORE_H), cname),
                         daemon=True,
                     ).start()
-                    logger.info(f"AutoCode: 4h warn sent для {r.get('buyer')} (left={int(left)}s)")
 
                 if (key not in warned_30m
                         and 1500 <= left <= 1800):
@@ -1143,7 +1253,6 @@ def _expiry_watcher(cardinal):
                         args=(cid, t(lang, "warn_30m"), cname),
                         daemon=True,
                     ).start()
-                    logger.info(f"AutoCode: 30m warn sent для {r.get('buyer')} (left={int(left)}s)")
 
                 if now >= exp + 60:
                     Thread(
@@ -1156,7 +1265,6 @@ def _expiry_watcher(cardinal):
                     warned_30m.discard(key)
                     changed = True
                     state_dirty = True
-                    logger.info(f"AutoCode: аренда {key} ({r.get('buyer')}) завершена.")
 
             if changed:
                 save_rentals(rents)
@@ -1205,8 +1313,8 @@ def _winback_worker(cardinal):
                         continue
 
                     text = settings.get("winback_template", "")
-                    try:
-                        cardinal.send_message(cid, text, buyer)
+                    ok, _ = _send_with_retry(cardinal, cid, text, buyer)
+                    if ok:
                         sent_log[buyer] = {
                             "sent_at": now,
                             "chat_id": cid,
@@ -1214,9 +1322,7 @@ def _winback_worker(cardinal):
                         }
                         new_sends += 1
                         logger.info(f"AutoCode winback sent: {buyer}")
-                        time.sleep(3)
-                    except Exception as ex:
-                        logger.warning(f"Winback send fail {buyer}: {ex}")
+                        time.sleep(BROADCAST_COOLDOWN_SEC)
 
                 if new_sends:
                     save_winback(sent_log)
@@ -1287,27 +1393,22 @@ def _parse_hours(text: str) -> int | None:
         return None
     s = text.lower()
 
-    # Years
     m = re.search(r"(\d+)\s*(?:год|года|лет|y|year|years)\b", s)
     if m:
         return int(m.group(1)) * 24 * 365
 
-    # Months
     m = re.search(r"(\d+)\s*(?:месяц|месяца|месяцев|мес\.?|month|months|mo)\b", s)
     if m:
         return int(m.group(1)) * 24 * 30
-
     if re.search(r"\bмесяц\b", s) and not re.search(r"\d+\s*месяц", s):
         return 24 * 30
 
-    # Weeks
     m = re.search(r"(\d+)\s*(?:неделя|недели|недель|нед\.?|week|weeks|w)\b", s)
     if m:
         return int(m.group(1)) * 24 * 7
     if re.search(r"\bнеделя\b", s) and not re.search(r"\d+\s*недел", s):
         return 24 * 7
 
-    # Days
     m = re.search(r"(\d+)\s*(?:день|дня|дней|сутки|суток|д\.?|d|day|days)\b", s)
     if m:
         return int(m.group(1)) * 24
@@ -1317,7 +1418,6 @@ def _parse_hours(text: str) -> int | None:
     if re.search(r"\bсутки\b", s) and not re.search(r"\d+\s*сут", s):
         return 24
 
-    # Hours
     m = re.search(r"(\d+)\s*(?:час|часа|часов|ч\.?|h|hour|hours|hr)\b", s)
     if m:
         return int(m.group(1))
@@ -1367,7 +1467,8 @@ def on_new_order(c, e: NewOrderEvent):
         logger.warning(f"AutoCode: нет аккаунта для лота {lot_id}")
         return
 
-    lang = detect_lang(desc + " " + lot_name)
+    # Determine language: prefer cache from prior chat, then lot description
+    lang = get_buyer_lang(buyer, desc + " " + lot_name)
 
     now   = time.time()
     rents = rentals()
@@ -1383,7 +1484,7 @@ def on_new_order(c, e: NewOrderEvent):
                     state[s_key].remove(k)
             save_warned(state)
 
-            cur_lang = r.get("lang", lang)
+            cur_lang = get_buyer_lang(buyer, "")
             Thread(
                 target=c.send_message,
                 args=(chat_id,
@@ -1391,7 +1492,6 @@ def on_new_order(c, e: NewOrderEvent):
                       chat_name),
                 daemon=True,
             ).start()
-            logger.info(f"AutoCode: продление {buyer} +{hours}ч")
             return
 
     expires_at = now + hours * 3600
@@ -1434,6 +1534,13 @@ def on_new_message(c, e: NewMessageEvent):
     chat_id   = e.message.chat_id
     chat_name = e.message.chat_name
 
+    # Update lang cache from FREEFORM messages only (not commands)
+    if not _is_command_message(text):
+        detected = detect_lang(text)
+        if detected:
+            _set_buyer_lang(buyer, detected)
+
+    # Get the lang for the response (uses cache → ignores current command msg)
     lang = get_buyer_lang(buyer, text)
 
     rents = rentals()
@@ -1444,7 +1551,7 @@ def on_new_message(c, e: NewMessageEvent):
                 rents[k]["chat_id"]   = chat_id
                 rents[k]["chat_name"] = chat_name
                 rents_changed = True
-            if not r.get("lang"):
+            if not r.get("lang") or r.get("lang") != lang:
                 rents[k]["lang"] = lang
                 rents_changed = True
     if rents_changed:
@@ -1548,6 +1655,8 @@ def init_autocode_tg(cardinal, *args):
     _cardinal_ref = cardinal
     bot = cardinal.telegram.bot
 
+    _load_lang_cache()
+
     _bcast = {"text": "", "failed": [], "scheduled_timer": None}
 
     @bot.message_handler(commands=["autocode"])
@@ -1559,6 +1668,70 @@ def init_autocode_tg(cardinal, *args):
     @bot.callback_query_handler(func=lambda c: c.data == AC_MAIN)
     def open_main(call: CallbackQuery):
         _safe_edit(bot, call, f"⚙️ AutoCode v{VERSION} — выберите раздел:", kb_main())
+
+    @bot.callback_query_handler(func=lambda c: c.data == AC_CHECK_ALL)
+    def check_all_mailboxes(call: CallbackQuery):
+        accs = accounts()
+        if not accs:
+            _safe_answer(bot, call, "Нет почт.", show_alert=True)
+            return
+        _safe_answer(bot, call, f"Проверяю {len(accs)} почт...")
+        bot.send_message(call.message.chat.id,
+            f"🔬 Запущена полная проверка {len(accs)} почт (IMAP + поиск кода)...")
+
+        def _run():
+            results = []
+            health = health_state()
+            for acc in accs:
+                try:
+                    r = full_check_account(acc)
+                except Exception as ex:
+                    r = {
+                        "email":    acc.get("email", "?"),
+                        "imap_ok":  False, "imap_msg": f"Exception: {ex}",
+                        "code_ok":  False, "code_msg": "",
+                        "code_found": None,
+                    }
+                results.append(r)
+                health[r["email"]] = {
+                    "last_check": time.time(),
+                    "ok":         r["imap_ok"],
+                    "message":    r["imap_msg"],
+                }
+            save_health(health)
+
+            ok_imap  = sum(1 for r in results if r["imap_ok"])
+            ok_code  = sum(1 for r in results if r["code_ok"])
+            lines = [
+                f"🔬 Результаты проверки ({len(results)} почт)",
+                f"✅ IMAP: {ok_imap}/{len(results)} | ✅ Код: {ok_code}/{len(results)}",
+                "",
+            ]
+            for r in results:
+                em = r["email"]
+                imap_mark = "✅" if r["imap_ok"] else "❌"
+                code_mark = "✅" if r["code_ok"] else ("⏭" if not r["imap_ok"] else "❌")
+                lines.append(f"📧 {em}")
+                lines.append(f"   {imap_mark} IMAP: {r['imap_msg']}")
+                lines.append(f"   {code_mark} Код: {r['code_msg']}"
+                             + (f" ({r['code_found']})" if r.get("code_found") else ""))
+                lines.append("")
+            full_text = "\n".join(lines).strip()
+
+            chunks, cur = [], ""
+            for line in full_text.split("\n"):
+                if len(cur) + len(line) + 1 > 3800:
+                    chunks.append(cur)
+                    cur = line
+                else:
+                    cur = cur + "\n" + line if cur else line
+            if cur:
+                chunks.append(cur)
+            for i, ch in enumerate(chunks):
+                kb = K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]]) if i == len(chunks) - 1 else None
+                bot.send_message(call.message.chat.id, ch, reply_markup=kb)
+
+        Thread(target=_run, daemon=True).start()
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LIST}:"))
     def open_list(call: CallbackQuery):
@@ -1825,7 +1998,6 @@ def init_autocode_tg(cardinal, *args):
         _safe_edit(bot, call, text,
             K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]]))
 
-    # ── Rentals (компактные, с пагинацией + first/last) ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_RENTALS or c.data.startswith(f"{AC_RENT_PAGE}:"))
     def open_rentals(call: CallbackQuery):
         try:
@@ -1859,7 +2031,6 @@ def init_autocode_tg(cardinal, *args):
             lines.append(f"{lang_tag} {buyer} • ⏳{remain} {warn}")
             rows.append([B(f"⚙️ {buyer}", callback_data=f"{AC_RENT_INFO}:{r['order_key']}")])
 
-        # Пагинация: ⏮ ◀ N/T ▶ ⏭
         nav = []
         if page > 0:
             nav.append(B("⏮", callback_data=f"{AC_RENT_PAGE}:0"))
@@ -1931,7 +2102,6 @@ def init_autocode_tg(cardinal, *args):
         call.data = f"{AC_RENT_INFO}:{key}"
         rent_info(call)
 
-    # ── Stats ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_STATS)
     def open_stats(call: CallbackQuery):
         _safe_edit(bot, call, "📊 Выберите период:", kb_stats_period())
@@ -1987,7 +2157,6 @@ def init_autocode_tg(cardinal, *args):
                 f"❌ Ошибка: {ex}\nПример: <code>01.05.2026-31.05.2026</code>",
                 parse_mode="HTML")
 
-    # ── Health ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_HEALTH)
     def open_health(call: CallbackQuery):
         accs = accounts()
@@ -2024,7 +2193,6 @@ def init_autocode_tg(cardinal, *args):
         save_health(h)
         open_health(call)
 
-    # ── Settings ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_REVIEW)
     def open_review(call: CallbackQuery):
         s = app_settings()
@@ -2085,7 +2253,6 @@ def init_autocode_tg(cardinal, *args):
         save_settings(s)
         bot.send_message(message.chat.id, "✅ Шаблон win-back сохранён.")
 
-    # ── Winback manual ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_WINBACK)
     def open_winback(call: CallbackQuery):
         sent = winback_sent()
@@ -2130,7 +2297,6 @@ def init_autocode_tg(cardinal, *args):
         _safe_answer(bot, call, "Запущено...")
         Thread(target=_winback_manual_run, args=(cardinal,), daemon=True).start()
 
-    # ── Broadcast ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_BROADCAST)
     def open_broadcast(call: CallbackQuery):
         active = get_active_rentals()
@@ -2163,7 +2329,11 @@ def init_autocode_tg(cardinal, *args):
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_RETRY)
     def bcast_retry(call: CallbackQuery):
-        _do_broadcast(call, _bcast.get("failed", []), is_retry=True)
+        failed = _bcast.get("failed", [])
+        if not failed:
+            _safe_answer(bot, call, "Нет неудачных отправок.")
+            return
+        _do_broadcast(call, failed, is_retry=True)
 
     def _do_broadcast(call, targets, is_retry=False):
         text = _bcast.get("text", "")
@@ -2175,20 +2345,40 @@ def init_autocode_tg(cardinal, *args):
             return
         _safe_answer(bot, call, "Рассылка запущена...")
 
-        pairs = targets if is_retry else [
-            (r["chat_id"], r.get("chat_name", "")) for r in targets
-        ]
+        if is_retry:
+            pairs = targets  # уже список (chat_id, chat_name)
+        else:
+            pairs = [(r["chat_id"], r.get("chat_name", "")) for r in targets]
+
+        progress_msg = bot.send_message(call.message.chat.id,
+            f"📢 Рассылка: 0/{len(pairs)}...")
 
         def _send_all():
             ok, fail = 0, []
-            for chat_id, chat_name in pairs:
-                try:
-                    cardinal.send_message(chat_id, text, chat_name)
+            total = len(pairs)
+            last_progress = time.time()
+
+            for i, (chat_id, chat_name) in enumerate(pairs, 1):
+                success, err = _send_with_retry(cardinal, chat_id, text, chat_name)
+                if success:
                     ok += 1
-                except Exception as ex:
-                    logger.warning(f"Broadcast fail {chat_id}: {ex}")
+                else:
                     fail.append((chat_id, chat_name))
-                time.sleep(2)
+                    logger.warning(f"Broadcast permanent fail {chat_id} after {BROADCAST_RETRY_MAX} attempts: {err}")
+
+                # Прогресс каждые 5 сообщений или 10 секунд
+                if i % 5 == 0 or (time.time() - last_progress) > 10:
+                    try:
+                        bot.edit_message_text(
+                            f"📢 Рассылка: {i}/{total}\n✅ {ok} | ❌ {len(fail)}",
+                            progress_msg.chat.id,
+                            progress_msg.message_id,
+                        )
+                    except Exception:
+                        pass
+                    last_progress = time.time()
+
+                time.sleep(BROADCAST_COOLDOWN_SEC)
 
             _bcast["failed"] = fail
 
@@ -2205,9 +2395,21 @@ def init_autocode_tg(cardinal, *args):
             if fail:
                 kb_rows.append([B(f"🔄 Повторить ({len(fail)})", callback_data=AC_BCAST_RETRY)])
             kb_rows.append([B("◀ Меню рассылки", callback_data=AC_BROADCAST)])
-            bot.send_message(call.message.chat.id,
-                f"📢 Рассылка завершена\n\n✅ Отправлено: {ok}\n❌ Не доставлено: {len(fail)}",
-                reply_markup=K(keyboard=kb_rows))
+
+            try:
+                bot.edit_message_text(
+                    f"📢 Рассылка завершена\n\n"
+                    f"✅ Отправлено: {ok}/{total}\n"
+                    f"❌ Не доставлено: {len(fail)}\n"
+                    f"⏱ Каждое с {BROADCAST_COOLDOWN_SEC}с задержкой + до {BROADCAST_RETRY_MAX} попыток",
+                    progress_msg.chat.id,
+                    progress_msg.message_id,
+                    reply_markup=K(keyboard=kb_rows),
+                )
+            except Exception:
+                bot.send_message(call.message.chat.id,
+                    f"📢 Рассылка завершена\n\n✅ Отправлено: {ok}/{total}\n❌ Не доставлено: {len(fail)}",
+                    reply_markup=K(keyboard=kb_rows))
 
         Thread(target=_send_all, daemon=True).start()
 
@@ -2307,12 +2509,12 @@ def init_autocode_tg(cardinal, *args):
                 targets = [r for r in get_active_rentals() if r.get("chat_id")]
                 ok, fail = 0, []
                 for r in targets:
-                    try:
-                        cardinal.send_message(r["chat_id"], _bcast["text"], r.get("chat_name", ""))
+                    success, _ = _send_with_retry(cardinal, r["chat_id"], _bcast["text"], r.get("chat_name", ""))
+                    if success:
                         ok += 1
-                    except Exception:
+                    else:
                         fail.append((r["chat_id"], r.get("chat_name", "")))
-                    time.sleep(2)
+                    time.sleep(BROADCAST_COOLDOWN_SEC)
                 hist = bcast_history()
                 hist.append({"time": time.time(), "text": _bcast["text"],
                              "sent": ok, "failed": len(fail)})
@@ -2336,7 +2538,6 @@ def init_autocode_tg(cardinal, *args):
             bot.send_message(message.chat.id,
                 "❌ Неверный формат. Пример: <code>31.05.2026 18:00</code>", parse_mode="HTML")
 
-    # ── Background workers ──
     Thread(target=_expiry_watcher,           args=(cardinal,), daemon=True).start()
     Thread(target=_startup_imap_test,        args=(cardinal,), daemon=True).start()
     Thread(target=_startup_sales_scan,       args=(cardinal,), daemon=True).start()
@@ -2384,17 +2585,15 @@ def _winback_manual_run(cardinal):
                 continue
 
             text = settings.get("winback_template", "")
-            try:
-                cardinal.send_message(cid, text, buyer)
+            success, _ = _send_with_retry(cardinal, cid, text, buyer)
+            if success:
                 sent_log[buyer] = {
                     "sent_at": now,
                     "chat_id": cid,
                     "last_rental_ts": last_ts,
                 }
                 new_sends += 1
-                time.sleep(3)
-            except Exception as ex:
-                logger.warning(f"Manual winback fail {buyer}: {ex}")
+                time.sleep(BROADCAST_COOLDOWN_SEC)
 
         if new_sends:
             save_winback(sent_log)

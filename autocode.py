@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cardinal import Cardinal
 
+import base64
 import email
 import email.header
 import imaplib
@@ -29,7 +30,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
@@ -109,11 +110,38 @@ IMAP_HOSTS = {
     "bk.ru":          "imap.mail.ru",
 }
 
-IMAP_TIMEOUT   = 15   # секунд на подключение
-CODE_CD        = 30   # кулдаун повторного запроса (сек)
-MAX_CODES_HOUR = 10   # лимит запросов в час на покупателя
-WARN_BEFORE_H  = 4    # предупреждение за N часов до конца аренды
-PRE_WINDOW     = 2 * 3600  # окно до покупки для поиска писем
+IMAP_TIMEOUT        = 15       # секунд на подключение
+CODE_CD             = 30       # кулдаун повторного запроса (сек)
+MAX_CODES_HOUR      = 10       # лимит запросов в час на покупателя
+WARN_BEFORE_H       = 4        # предупреждение за N часов до конца аренды
+PRE_WINDOW          = 2 * 3600 # окно до покупки для поиска писем
+USED_CODE_TTL_SEC   = 3 * 3600 # авто-очистка: удалять использованные коды старше 3 часов
+WEEKLY_REPORT_DOW   = 6        # день недели для еженедельного отчёта (0=пн, 6=вс)
+WEEKLY_REPORT_HOUR  = 9        # час отправки отчёта
+
+# ── Простое XOR-шифрование паролей ─────────────────────────────────────────
+# Ключ берётся из переменной окружения AC_SECRET или фиксированного дефолта.
+# Не является криптографически стойким, но скрывает пароли от случайного просмотра файла.
+_SECRET_KEY = (os.environ.get("AC_SECRET") or "ac_fp_secret_2025").encode()
+
+def _xor_crypt(data: str) -> str:
+    """Шифрует/расшифровывает строку XOR + base64."""
+    raw   = data.encode("utf-8")
+    key   = _SECRET_KEY
+    xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+    return base64.b64encode(xored).decode()
+
+def _encrypt_password(plain: str) -> str:
+    return _xor_crypt(plain)
+
+def _decrypt_password(enc: str) -> str:
+    try:
+        raw   = base64.b64decode(enc.encode())
+        key   = _SECRET_KEY
+        xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+        return xored.decode("utf-8")
+    except Exception:
+        return enc  # если не удалось расшифровать — вернуть как есть (plain-текст, совместимость)
 
 _cardinal_ref = None
 
@@ -227,13 +255,11 @@ def _find_code(plain, html, subj, acc) -> str | None:
 
     text = plain or _html_to_text(html)
 
-    # Strategy 1: standalone line
     for line in text.splitlines():
         line = line.strip()
         if pat.fullmatch(line):
             return line
 
-    # Strategy 2: keyword proximity
     keywords = ["код", "code", "ключ", "key", "enter", "активац"]
     for kw in keywords:
         idx = text.lower().find(kw)
@@ -243,20 +269,26 @@ def _find_code(plain, html, subj, acc) -> str | None:
             if m:
                 return m.group()
 
-    # Strategy 3: first match
     m = pat.search(text)
     return m.group() if m else None
 
 # ── IMAP fetch ───────────────────────────────────────────────────────────────
 def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
     email_addr  = acc.get("email", "")
-    password    = acc.get("password", "")
+    password    = _decrypt_password(acc.get("password", ""))
     imap_host   = acc.get("imap_host") or detect_imap_host(email_addr)
     max_age     = acc.get("max_age_min", 60)
     filter_from = acc.get("filter_from", "")
     filter_subj = acc.get("filter_subj", "")
 
-    used_set = set(used.get(email_addr, []))
+    # used_codes теперь хранит [{code, used_at}] — извлекаем только строки кодов
+    raw_used = used.get(email_addr, [])
+    used_set = set()
+    for entry in raw_used:
+        if isinstance(entry, dict):
+            used_set.add(entry.get("code", ""))
+        else:
+            used_set.add(entry)
 
     try:
         mail = imaplib.IMAP4_SSL(imap_host, timeout=IMAP_TIMEOUT)
@@ -310,10 +342,11 @@ def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
         return None, f"Ошибка: {e}"
 
 def test_imap(acc) -> str:
-    host = acc.get("imap_host") or detect_imap_host(acc.get("email", ""))
+    host     = acc.get("imap_host") or detect_imap_host(acc.get("email", ""))
+    password = _decrypt_password(acc.get("password", ""))
     try:
         mail = imaplib.IMAP4_SSL(host, timeout=IMAP_TIMEOUT)
-        mail.login(acc["email"], acc["password"])
+        mail.login(acc["email"], password)
         mail.select("INBOX")
         mail.logout()
         return f"✅ Подключение успешно ({host})"
@@ -422,9 +455,9 @@ def _stats_text(entries, label: str) -> str:
     peak = Counter(hours_list).most_common(3)
     peak_str = ", ".join(f"{h:02d}:00 ({c})" for h, c in peak) or "—"
 
-    all_rents    = _load(RENTALS_FILE, {})
+    all_rents     = _load(RENTALS_FILE, {})
     rent_by_buyer = Counter(r.get("buyer") for r in all_rents.values())
-    top_renters  = "\n".join(
+    top_renters   = "\n".join(
         f"  {i+1}. {b}: {c} аренд"
         for i, (b, c) in enumerate(rent_by_buyer.most_common(3))
     ) or "  —"
@@ -467,6 +500,77 @@ def _notify_tg_rate_limit(cardinal, buyer, count):
     _notify_tg(cardinal,
         f"🚨 Лимит запросов\nПокупатель {buyer} сделал {count} запросов за час.")
 
+# ── IMAP startup test ────────────────────────────────────────────────────────
+def _startup_imap_test(cardinal):
+    """Проверяет все аккаунты при запуске и шлёт TG-алерт если что-то сломано."""
+    time.sleep(5)  # дать Cardinal время инициализироваться
+    accs = accounts()
+    if not accs:
+        return
+    broken = []
+    for acc in accs:
+        result = test_imap(acc)
+        if result.startswith("❌"):
+            broken.append(f"📧 {acc['email']}\n   {result}")
+    if broken:
+        msg = "🚨 AutoCode — проблемы с IMAP при старте:\n\n" + "\n\n".join(broken)
+        _notify_tg(cardinal, msg)
+        logger.warning(f"AutoCode startup IMAP errors: {broken}")
+    else:
+        logger.info(f"AutoCode: все {len(accs)} IMAP-аккаунтов прошли проверку при старте.")
+
+# ── Авто-очистка использованных кодов (TTL 3 часа) ──────────────────────────
+def _used_code_cleanup_worker():
+    """Раз в час удаляет из used_codes.json записи старше USED_CODE_TTL_SEC."""
+    while True:
+        time.sleep(3600)
+        try:
+            now  = time.time()
+            used = used_codes()
+            changed = False
+            for email_addr, entries in used.items():
+                new_entries = []
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        if now - entry.get("used_at", 0) < USED_CODE_TTL_SEC:
+                            new_entries.append(entry)
+                        else:
+                            changed = True
+                    else:
+                        # старый формат (plain string) — конвертируем с текущим временем
+                        new_entries.append({"code": entry, "used_at": now})
+                        changed = True
+                used[email_addr] = new_entries
+            if changed:
+                save_used(used)
+                logger.info("AutoCode: очистка использованных кодов выполнена.")
+        except Exception as e:
+            logger.error(f"Used-code cleanup error: {e}")
+
+# ── Еженедельный отчёт ───────────────────────────────────────────────────────
+def _weekly_report_worker(cardinal):
+    """Каждое воскресенье в WEEKLY_REPORT_HOUR шлёт сводный отчёт в TG."""
+    while True:
+        now = datetime.now()
+        # Следующий WEEKLY_REPORT_DOW в WEEKLY_REPORT_HOUR:00
+        days_ahead = (WEEKLY_REPORT_DOW - now.weekday()) % 7
+        if days_ahead == 0 and now.hour >= WEEKLY_REPORT_HOUR:
+            days_ahead = 7
+        next_run = now.replace(hour=WEEKLY_REPORT_HOUR, minute=0, second=0, microsecond=0) \
+                   + timedelta(days=days_ahead)
+        sleep_sec = (next_run - datetime.now()).total_seconds()
+        time.sleep(max(sleep_sec, 60))
+        try:
+            entries_7d = _filter_log_by_hours(168)
+            text = (
+                f"📅 Еженедельный отчёт AutoCode\n"
+                f"{(datetime.now() - timedelta(days=7)).strftime('%d.%m')} — "
+                f"{datetime.now().strftime('%d.%m.%Y')}\n\n"
+            ) + _stats_text(entries_7d, "7 дней")
+            _notify_tg(cardinal, text)
+        except Exception as e:
+            logger.error(f"Weekly report error: {e}")
+
 # ── Expiry watcher ───────────────────────────────────────────────────────────
 def _expiry_watcher(cardinal):
     warned_4h  = set()
@@ -478,11 +582,10 @@ def _expiry_watcher(cardinal):
             now     = time.time()
             changed = False
             for key, r in list(rents.items()):
-                exp       = r.get("expires_at", 0)
-                cid       = r.get("chat_id")
-                cname     = r.get("chat_name", "")
+                exp   = r.get("expires_at", 0)
+                cid   = r.get("chat_id")
+                cname = r.get("chat_name", "")
 
-                # 4-часовое предупреждение
                 if key not in warned_4h and 0 < exp - now <= WARN_BEFORE_H * 3600:
                     warned_4h.add(key)
                     Thread(
@@ -494,7 +597,6 @@ def _expiry_watcher(cardinal):
                         daemon=True,
                     ).start()
 
-                # 30-минутное предупреждение
                 if key not in warned_30m and 0 < exp - now <= 1800:
                     warned_30m.add(key)
                     Thread(
@@ -503,7 +605,6 @@ def _expiry_watcher(cardinal):
                         daemon=True,
                     ).start()
 
-                # Истекла
                 if now > exp:
                     Thread(
                         target=cardinal.send_message,
@@ -596,6 +697,15 @@ def on_new_order(c, e: NewOrderEvent):
     save_rentals(rents)
     logger.info(f"AutoCode: новая аренда {buyer} | {acc_email} | {hours}ч | до {_fmt_time(expires_at)}")
 
+    # Уведомление о старте аренды
+    Thread(
+        target=c.send_message,
+        args=(chat_id,
+              f"🌸 | Аренда активирована, напиши команду в чат: !cd или code",
+              chat_name),
+        daemon=True,
+    ).start()
+
 # ── on_new_message ────────────────────────────────────────────────────────────
 def on_new_message(c, e: NewMessageEvent):
     global _cardinal_ref
@@ -604,13 +714,36 @@ def on_new_message(c, e: NewMessageEvent):
     if e.message.author_id == c.account.id:
         return
 
-    text = (e.message.text or "").strip()
-    if text.lower() not in ("!cd", "code"):
-        return
+    text  = (e.message.text or "").strip()
+    lower = text.lower()
 
     buyer     = e.message.author
     chat_id   = e.message.chat_id
     chat_name = e.message.chat_name
+
+    # ── Команда !time — показать остаток аренды ──
+    if lower == "!time":
+        now   = time.time()
+        rents = rentals()
+        active = sorted(
+            [r for r in rents.values() if r.get("buyer") == buyer and r.get("expires_at", 0) > now],
+            key=lambda r: r.get("purchase_ts", 0),
+            reverse=True,
+        )
+        if not active:
+            reply = "❌ У вас нет активной аренды."
+        else:
+            r     = active[0]
+            reply = (
+                f"⏳ Осталось: {_fmt_remaining(r['expires_at'])}\n"
+                f"📅 Окончание: {_fmt_time(r['expires_at'])}"
+            )
+        Thread(target=c.send_message, args=(chat_id, reply, chat_name), daemon=True).start()
+        return
+
+    # ── Команды !cd / code — выдача кода ──
+    if lower not in ("!cd", "code"):
+        return
 
     # Rate limit / cooldown
     allowed, reason = _check_rate(buyer)
@@ -664,7 +797,9 @@ def on_new_message(c, e: NewMessageEvent):
         ).start()
         return
 
-    used.setdefault(acc_email, []).append(code_val)
+    # Сохраняем с временной меткой (новый формат)
+    entry = {"code": code_val, "used_at": time.time()}
+    used.setdefault(acc_email, []).append(entry)
     save_used(used)
     add_log(acc_email, rental.get("lot_id", "—"), buyer, code_val)
 
@@ -683,12 +818,12 @@ def init_autocode_tg(cardinal, *args):
     # /autocode command
     @bot.message_handler(commands=["autocode"])
     def cmd_autocode(message: Message):
-        bot.send_message(message.chat.id, "⚙️ AutoCode v5", reply_markup=kb_main())
+        bot.send_message(message.chat.id, "⚙️ AutoCode v5.1", reply_markup=kb_main())
 
     # Main menu
     @bot.callback_query_handler(func=lambda c: c.data == AC_MAIN)
     def open_main(call: CallbackQuery):
-        bot.edit_message_text("⚙️ AutoCode v5", call.message.chat.id,
+        bot.edit_message_text("⚙️ AutoCode v5.1", call.message.chat.id,
                               call.message.message_id, reply_markup=kb_main())
 
     # ── Account list ──
@@ -727,10 +862,11 @@ def init_autocode_tg(cardinal, *args):
 
     def _step_pass(message: Message, idx: int):
         accs = accounts()
-        accs[idx]["password"] = message.text.strip()
+        plain = message.text.strip()
+        accs[idx]["password"] = _encrypt_password(plain)
         save_accs(accs)
         bot.send_message(message.chat.id,
-            f"✅ Пароль сохранён.\nIMAP: {accs[idx]['imap_host']}\n"
+            f"✅ Пароль сохранён (зашифрован).\nIMAP: {accs[idx]['imap_host']}\n"
             f"Используйте /autocode → редактировать для дополнительных настроек.")
 
     # ── Edit account ──
@@ -748,7 +884,8 @@ def init_autocode_tg(cardinal, *args):
             f"🔤 Тип: {acc.get('code_type', 'alnum')} | "
             f"Длина: {acc.get('code_len', 0) or 'авто'}\n"
             f"📬 От: {acc.get('filter_from') or '—'} | "
-            f"Тема: {acc.get('filter_subj') or '—'}"
+            f"Тема: {acc.get('filter_subj') or '—'}\n"
+            f"🔐 Пароль: {'зашифрован' if acc.get('password') else 'не задан'}"
         )
         kb = K(keyboard=[
             [B("🔌 IMAP хост",  callback_data=f"{AC_IMAP}:{idx}"),
@@ -757,11 +894,24 @@ def init_autocode_tg(cardinal, *args):
              B("🔤 Тип кода",   callback_data=f"{AC_TYPE}:{idx}")],
             [B("📬 От (from)",  callback_data=f"{AC_FROM}:{idx}"),
              B("📌 Тема",       callback_data=f"{AC_SUBJ}:{idx}")],
-            [B("🔍 Тест IMAP",  callback_data=f"{AC_TEST}:{idx}"),
-             B("🗑 Удалить",    callback_data=f"{AC_DEL_ASK}:{idx}")],
+            [B("🔑 Сменить пароль", callback_data=f"ac_chpass:{idx}"),
+             B("🔍 Тест IMAP",  callback_data=f"{AC_TEST}:{idx}")],
+            [B("🗑 Удалить",    callback_data=f"{AC_DEL_ASK}:{idx}")],
             [B("◀ Назад",       callback_data=f"{AC_LIST}:0")],
         ])
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ac_chpass:"))
+    def act_chpass(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id, "Введите новый пароль:")
+        bot.register_next_step_handler(msg, lambda m: _do_chpass(m, idx))
+
+    def _do_chpass(message: Message, idx: int):
+        accs = accounts()
+        accs[idx]["password"] = _encrypt_password(message.text.strip())
+        save_accs(accs)
+        bot.send_message(message.chat.id, "✅ Пароль обновлён (зашифрован).")
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_IMAP}:"))
     def act_imap(call: CallbackQuery):
@@ -1183,9 +1333,12 @@ def init_autocode_tg(cardinal, *args):
             bot.send_message(message.chat.id,
                 "❌ Неверный формат. Пример: <code>31.05.2026 18:00</code>", parse_mode="HTML")
 
-    # ── Start expiry watcher ──
-    Thread(target=_expiry_watcher, args=(cardinal,), daemon=True).start()
-    logger.info("AutoCode v5.0.0 инициализирован.")
+    # ── Запуск фоновых воркеров ──
+    Thread(target=_expiry_watcher,           args=(cardinal,), daemon=True).start()
+    Thread(target=_startup_imap_test,        args=(cardinal,), daemon=True).start()
+    Thread(target=_used_code_cleanup_worker,              daemon=True).start()
+    Thread(target=_weekly_report_worker,     args=(cardinal,), daemon=True).start()
+    logger.info("AutoCode v5.1.0 инициализирован.")
 
 
 # ── Plugin hooks ─────────────────────────────────────────────────────────────

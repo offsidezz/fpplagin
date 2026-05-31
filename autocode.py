@@ -34,12 +34,11 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
-    "v5.2.0: очередь IMAP, мультиязычность, health check, авто-отзыв, "
-    "winback, шифрование, graceful shutdown.\n"
+    "v5.2.1: компактные аренды, фикс кнопок статистики.\n"
     "Управление: /autocode"
 )
 CREDITS = "@offsidezq"
@@ -69,6 +68,8 @@ AC_BODY          = "ac_body"
 AC_TEST          = "ac_test"
 AC_LOG           = "ac_log"
 AC_RENTALS       = "ac_rentals"
+AC_RENT_PAGE     = "ac_rent_p"
+AC_RENT_INFO     = "ac_rent_i"
 AC_RENT_DEL      = "ac_rent_del"
 AC_RENT_DEL_OK   = "ac_rent_del_ok"
 AC_RENT_EXT      = "ac_rent_ext"
@@ -109,10 +110,8 @@ HEALTH_FILE     = os.path.join(DATA_DIR, "imap_health.json")
 WINBACK_FILE    = os.path.join(DATA_DIR, "winback_sent.json")
 SETTINGS_FILE   = os.path.join(DATA_DIR, "settings.json")
 
-# Encrypted files (содержат чувствительные данные)
 ENCRYPTED_FILES = {RENTALS_FILE, USED_FILE, ACCOUNTS_FILE}
 
-# ── IMAP auto-detect map ────────────────────────────────────────────────────
 IMAP_HOSTS = {
     "gmail.com":      "imap.gmail.com",
     "googlemail.com": "imap.gmail.com",
@@ -128,23 +127,23 @@ IMAP_HOSTS = {
     "bk.ru":          "imap.mail.ru",
 }
 
-IMAP_TIMEOUT        = 15
-CODE_CD             = 30
-MAX_CODES_HOUR      = 10
-WARN_BEFORE_H       = 4
-PRE_WINDOW          = 2 * 3600
-USED_CODE_TTL_SEC   = 3 * 3600
-WEEKLY_REPORT_DOW   = 6
-WEEKLY_REPORT_HOUR  = 9
-RENTAL_GRACE_SEC    = 300
-HEALTH_CHECK_INTERVAL = 3600  # раз в час
-REVIEW_DELAY_SEC    = 30 * 60  # 30 минут
-WINBACK_AFTER_DAYS  = 3
-WINBACK_MAX_DAYS    = 30  # не трогать аренды старше 30 дней
+IMAP_TIMEOUT          = 15
+CODE_CD               = 30
+MAX_CODES_HOUR        = 10
+WARN_BEFORE_H         = 4
+PRE_WINDOW            = 2 * 3600
+USED_CODE_TTL_SEC     = 3 * 3600
+WEEKLY_REPORT_DOW     = 6
+WEEKLY_REPORT_HOUR    = 9
+RENTAL_GRACE_SEC      = 300
+HEALTH_CHECK_INTERVAL = 3600
+REVIEW_DELAY_SEC      = 30 * 60
+WINBACK_AFTER_DAYS    = 3
+WINBACK_MAX_DAYS      = 30
+RENTALS_PAGE_SIZE     = 8
 
-# ── XOR password encryption ─────────────────────────────────────────────────
 _SECRET_KEY = (os.environ.get("AC_SECRET") or "ac_fp_secret_2025").encode()
-_ENC_MARKER = "ACENC1:"  # маркер зашифрованного JSON-файла
+_ENC_MARKER = "ACENC1:"
 
 def _xor_bytes(data: bytes) -> bytes:
     key = _SECRET_KEY
@@ -164,25 +163,22 @@ def _decrypt_password(enc: str) -> str:
         return enc
 
 def _encrypt_file_content(plain_json: str) -> str:
-    """Шифрует JSON-строку для записи на диск."""
     encoded = base64.b64encode(_xor_bytes(plain_json.encode("utf-8"))).decode()
     return _ENC_MARKER + encoded
 
 def _decrypt_file_content(raw: str) -> str:
-    """Расшифровывает содержимое файла. Если маркера нет — возвращает как есть (миграция)."""
     if not raw.startswith(_ENC_MARKER):
         return raw
     try:
         encoded = raw[len(_ENC_MARKER):]
         return _xor_bytes(base64.b64decode(encoded.encode())).decode("utf-8")
     except Exception as e:
-        logger.error(f"AutoCode: ошибка расшифровки файла: {e}")
+        logger.error(f"AutoCode: ошибка расшифровки: {e}")
         return raw
 
 _cardinal_ref = None
 _shutdown_flag = {"stop": False}
 
-# ── Storage helpers ──────────────────────────────────────────────────────────
 def _ensure():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -207,7 +203,6 @@ def _save(path, data):
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
         if path in ENCRYPTED_FILES:
             json_str = _encrypt_file_content(json_str)
-        # атомарная запись через временный файл
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json_str)
@@ -233,12 +228,12 @@ def save_health(d):        _save(HEALTH_FILE, d)
 def winback_sent():        return _load(WINBACK_FILE, {})
 def save_winback(d):       _save(WINBACK_FILE, d)
 def app_settings():        return _load(SETTINGS_FILE, {
-    "review_enabled":      True,
-    "review_template":     "Если код подошёл — буду благодарен за отзыв 🙏 Это очень помогает!",
-    "winback_enabled":     True,
-    "winback_template":    "👋 Скучаем! Возвращайся — даём промокод RETURN25 на скидку 25% на следующую аренду. Просто напиши в чат, когда соберёшься заказывать.",
-    "winback_discount":    25,
-    "queue_pause_sec":     2,
+    "review_enabled":   True,
+    "review_template":  "Если код подошёл — буду благодарен за отзыв 🙏 Это очень помогает!",
+    "winback_enabled":  True,
+    "winback_template": "👋 Скучаем! Возвращайся — даём промокод RETURN25 на скидку 25% на следующую аренду. Просто напиши в чат, когда соберёшься заказывать.",
+    "winback_discount": 25,
+    "queue_pause_sec":  2,
 })
 def save_settings(d):      _save(SETTINGS_FILE, d)
 
@@ -257,28 +252,35 @@ def add_log(email_addr, lot_id, buyer, code, chat_id=None):
 def _fmt_time(ts):
     return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
 
+def _fmt_time_short(ts):
+    return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+
 def _fmt_remaining(ts):
     left = max(0, int(ts - time.time()))
     h, m = divmod(left // 60, 60)
-    return f"{h}ч {m:02d}мин"
+    return f"{h}ч {m:02d}м"
 
-# ── IMAP host auto-detect ────────────────────────────────────────────────────
+def _fmt_remaining_compact(ts):
+    left = max(0, int(ts - time.time()))
+    h, m = divmod(left // 60, 60)
+    if h >= 24:
+        d, h = divmod(h, 24)
+        return f"{d}д{h:02d}ч"
+    return f"{h}ч{m:02d}м"
+
 def detect_imap_host(email_addr: str) -> str:
     domain = email_addr.split("@")[-1].lower()
     return IMAP_HOSTS.get(domain, f"imap.{domain}")
 
-# ── Language detection ──────────────────────────────────────────────────────
 _RU_RE = re.compile(r"[а-яА-ЯёЁ]")
 
 def detect_lang(text: str) -> str:
-    """Возвращает 'ru' или 'en'. Базовая эвристика по кириллице."""
     if not text:
         return "ru"
     ru_chars = len(_RU_RE.findall(text))
     total    = max(1, len(re.findall(r"[a-zA-Zа-яА-ЯёЁ]", text)))
     return "ru" if (ru_chars / total) >= 0.3 else "en"
 
-# Locale strings
 L = {
     "ru": {
         "rental_activated":   "🌸 | Аренда активирована, напиши команду в чат: !cd или code",
@@ -315,7 +317,6 @@ L = {
 }
 
 def t(lang: str, key: str, **kwargs) -> str:
-    """Локализованная строка."""
     bundle = L.get(lang, L["ru"])
     text = bundle.get(key, L["ru"].get(key, key))
     if kwargs:
@@ -326,14 +327,12 @@ def t(lang: str, key: str, **kwargs) -> str:
     return text
 
 def get_buyer_lang(buyer: str, fallback_text: str = "") -> str:
-    """Берёт сохранённый язык покупателя или определяет из текста."""
     rents = rentals()
     for r in rents.values():
         if r.get("buyer") == buyer and r.get("lang"):
             return r["lang"]
     return detect_lang(fallback_text)
 
-# ── Email parsing ────────────────────────────────────────────────────────────
 def _decode_str(value: str) -> str:
     parts = email.header.decode_header(value)
     result = []
@@ -405,7 +404,6 @@ def _find_code(plain, html, subj, acc) -> str | None:
     m = pat.search(text)
     return m.group() if m else None
 
-# ── IMAP fetch ───────────────────────────────────────────────────────────────
 def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
     email_addr  = acc.get("email", "")
     password    = _decrypt_password(acc.get("password", ""))
@@ -485,12 +483,7 @@ def test_imap(acc) -> str:
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# ── IMAP Queue (per-mailbox serialization) ──────────────────────────────────
 class IMAPQueue:
-    """
-    Один воркер на каждую почту. Запросы fetch_code сериализуются по email,
-    чтобы IMAP не получал несколько параллельных коннектов.
-    """
     def __init__(self):
         self.queues: dict[str, queue.Queue] = {}
         self.workers: dict[str, Thread] = {}
@@ -537,7 +530,6 @@ class IMAPQueue:
 
 _imap_queue = IMAPQueue()
 
-# ── Rental helpers ───────────────────────────────────────────────────────────
 def get_active_rentals() -> list:
     now = time.time()
     return [r for r in rentals().values() if r.get("expires_at", 0) > now]
@@ -550,7 +542,6 @@ def get_expiring_rentals(within_hours: float) -> list:
         if now < r.get("expires_at", 0) <= cutoff
     ]
 
-# ── Rate-limit helpers ───────────────────────────────────────────────────────
 _code_requests: dict[str, list[float]] = {}
 _last_code_ts:  dict[str, float]       = {}
 
@@ -572,11 +563,10 @@ def _record_request(buyer: str):
     _last_code_ts[buyer] = now
     _code_requests.setdefault(buyer, []).append(now)
 
-# ── Keyboards ────────────────────────────────────────────────────────────────
 def kb_main():
     return K(keyboard=[
         [B("📬 Список почт",     callback_data=f"{AC_LIST}:0")],
-        [B("🏠 Активные аренды", callback_data=AC_RENTALS),
+        [B("🏠 Активные аренды", callback_data=f"{AC_RENT_PAGE}:0"),
          B("📜 Лог выдач",       callback_data=AC_LOG)],
         [B("📊 Статистика",      callback_data=AC_STATS),
          B("📢 Рассылка",        callback_data=AC_BROADCAST)],
@@ -587,19 +577,19 @@ def kb_main():
 
 def kb_stats_period():
     return K(keyboard=[
-        [B("⏱ 24 часа",     callback_data=AC_STATS_24H),
-         B("⏱ 48 часов",    callback_data=AC_STATS_48H)],
-        [B("📅 7 дней",      callback_data=AC_STATS_7D),
-         B("📋 Всё время",   callback_data=AC_STATS_ALL)],
-        [B("🗓 Свой период", callback_data=AC_STATS_RANGE)],
-        [B("◀ Назад",        callback_data=AC_MAIN)],
+        [B("⏱ 24ч",    callback_data=AC_STATS_24H),
+         B("⏱ 48ч",    callback_data=AC_STATS_48H)],
+        [B("📅 7д",     callback_data=AC_STATS_7D),
+         B("📋 Всё",    callback_data=AC_STATS_ALL)],
+        [B("🗓 Период", callback_data=AC_STATS_RANGE)],
+        [B("◀ Назад",   callback_data=AC_MAIN)],
     ])
 
 def kb_broadcast_menu():
     return K(keyboard=[
         [B("✍️ Новое сообщение",  callback_data=AC_BCAST_SEND)],
         [B("📁 Шаблоны",          callback_data=AC_BCAST_TPLS)],
-        [B("📋 История рассылок", callback_data=AC_BCAST_HIST)],
+        [B("📋 История",          callback_data=AC_BCAST_HIST)],
         [B("⏰ Отложенная",       callback_data=AC_BCAST_SCHED)],
         [B("◀ Назад",             callback_data=AC_MAIN)],
     ])
@@ -615,7 +605,6 @@ def kb_templates(tpls):
     rows.append([B("◀ Назад",           callback_data=AC_BROADCAST)])
     return K(keyboard=rows)
 
-# ── Stats helpers ────────────────────────────────────────────────────────────
 def _filter_log_by_hours(hours):
     entries = log_entries()
     if hours is None:
@@ -632,8 +621,8 @@ def _filter_log_by_range(date_from, date_to):
 
 def _stats_text(entries, label: str) -> str:
     total    = len(entries)
-    by_email = Counter(e.get("email") for e in entries)
-    by_buyer = Counter(e.get("buyer") for e in entries)
+    by_email = Counter(e.get("email") for e in entries if e.get("email"))
+    by_buyer = Counter(e.get("buyer") for e in entries if e.get("buyer"))
 
     hours_list = [
         datetime.fromtimestamp(e["time"]).hour
@@ -643,7 +632,7 @@ def _stats_text(entries, label: str) -> str:
     peak_str = ", ".join(f"{h:02d}:00 ({c})" for h, c in peak) or "—"
 
     all_rents     = _load(RENTALS_FILE, {})
-    rent_by_buyer = Counter(r.get("buyer") for r in all_rents.values())
+    rent_by_buyer = Counter(r.get("buyer") for r in all_rents.values() if r.get("buyer"))
     top_renters   = "\n".join(
         f"  {i+1}. {b}: {c} аренд"
         for i, (b, c) in enumerate(rent_by_buyer.most_common(3))
@@ -670,7 +659,6 @@ def _stats_text(entries, label: str) -> str:
         f"Топ покупателей (аренды):\n{top_renters}"
     )
 
-# ── TG notifications ─────────────────────────────────────────────────────────
 def _notify_tg(cardinal, text: str):
     try:
         bot = cardinal.telegram.bot
@@ -687,7 +675,37 @@ def _notify_tg_rate_limit(cardinal, buyer, count):
     _notify_tg(cardinal,
         f"🚨 Лимит запросов\nПокупатель {buyer} сделал {count} запросов за час.")
 
-# ── IMAP startup test ────────────────────────────────────────────────────────
+def _safe_edit(bot, call, text, kb, parse_mode=None):
+    """Безопасный edit_message_text — глушит MessageNotModified."""
+    try:
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=kb,
+            parse_mode=parse_mode,
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "message is not modified" in msg or "not modified" in msg:
+            try:
+                bot.answer_callback_query(call.id, "Уже актуально")
+            except Exception:
+                pass
+            return
+        logger.warning(f"AutoCode edit failed: {e}")
+        try:
+            bot.send_message(call.message.chat.id, text,
+                             reply_markup=kb, parse_mode=parse_mode)
+        except Exception:
+            pass
+
+def _safe_answer(bot, call, text="", show_alert=False):
+    try:
+        bot.answer_callback_query(call.id, text, show_alert=show_alert)
+    except Exception:
+        pass
+
 def _startup_imap_test(cardinal):
     time.sleep(5)
     accs = accounts()
@@ -710,11 +728,9 @@ def _startup_imap_test(cardinal):
         _notify_tg(cardinal, msg)
         logger.warning(f"AutoCode startup IMAP errors: {broken}")
     else:
-        logger.info(f"AutoCode: все {len(accs)} IMAP-аккаунтов прошли проверку при старте.")
+        logger.info(f"AutoCode: все {len(accs)} IMAP-аккаунтов прошли проверку.")
 
-# ── IMAP Health Check (hourly) ──────────────────────────────────────────────
 def _imap_health_worker(cardinal):
-    """Раз в час проверяет все почты, шлёт алерт если что-то сломалось."""
     time.sleep(HEALTH_CHECK_INTERVAL)
     while not _shutdown_flag["stop"]:
         try:
@@ -756,13 +772,11 @@ def _imap_health_worker(cardinal):
         except Exception as e:
             logger.error(f"Health check error: {e}")
 
-        # спим час с проверкой shutdown
         for _ in range(HEALTH_CHECK_INTERVAL):
             if _shutdown_flag["stop"]:
                 return
             time.sleep(1)
 
-# ── Startup sales scan ──────────────────────────────────────────────────────
 def _startup_sales_scan(cardinal):
     time.sleep(10)
     try:
@@ -940,9 +954,8 @@ def _startup_sales_scan(cardinal):
             )
 
     except Exception as e:
-        logger.error(f"AutoCode: ошибка сканирования продаж при старте: {e}")
+        logger.error(f"AutoCode: ошибка сканирования продаж: {e}")
 
-# ── Used-code cleanup ────────────────────────────────────────────────────────
 def _used_code_cleanup_worker():
     while not _shutdown_flag["stop"]:
         for _ in range(3600):
@@ -971,7 +984,6 @@ def _used_code_cleanup_worker():
         except Exception as e:
             logger.error(f"Used-code cleanup error: {e}")
 
-# ── Weekly report ────────────────────────────────────────────────────────────
 def _weekly_report_worker(cardinal):
     while not _shutdown_flag["stop"]:
         now = datetime.now()
@@ -981,7 +993,6 @@ def _weekly_report_worker(cardinal):
         next_run = now.replace(hour=WEEKLY_REPORT_HOUR, minute=0, second=0, microsecond=0) \
                    + timedelta(days=days_ahead)
         sleep_sec = (next_run - datetime.now()).total_seconds()
-        # дробим сон
         end = time.time() + max(sleep_sec, 60)
         while time.time() < end:
             if _shutdown_flag["stop"]:
@@ -998,20 +1009,11 @@ def _weekly_report_worker(cardinal):
         except Exception as e:
             logger.error(f"Weekly report error: {e}")
 
-# ── Expiry watcher (FIXED: персистентный warned + правильное окно 4ч) ───────
 def _expiry_watcher(cardinal):
-    """
-    Исправления:
-    1. warned_4h / warned_30m теперь хранятся в файле — не теряются при перезапуске.
-    2. Окно отправки 4ч-напоминания сужено: только когда осталось 3:50 — 4:00ч
-       (раньше срабатывало при любом времени <= 4ч, что давало повторные алерты).
-    3. Окно для 30-минутного: 25-30 минут.
-    """
     startup_ts = time.time()
     state = warned_state()
     warned_4h = set(state.get("warned_4h", []))
     warned_30m = set(state.get("warned_30m", []))
-    state_dirty = False
 
     def _persist_state():
         save_warned({
@@ -1029,7 +1031,6 @@ def _expiry_watcher(cardinal):
             changed = False
             state_dirty = False
 
-            # GC: убираем из warned те ключи, которых уже нет в rentals
             for s in (warned_4h, warned_30m):
                 stale = [k for k in s if k not in rents]
                 for k in stale:
@@ -1061,8 +1062,6 @@ def _expiry_watcher(cardinal):
                         logger.info(f"AutoCode: аренда {key} ({r.get('buyer')}) завершена (без chat_id).")
                     continue
 
-                # 4ч предупреждение — только в узком окне 3:50 — 4:00 ч до окончания
-                # И только если ещё не предупреждали
                 four_h = WARN_BEFORE_H * 3600
                 if (key not in warned_4h
                         and (four_h - 600) <= left <= four_h):
@@ -1075,7 +1074,6 @@ def _expiry_watcher(cardinal):
                     ).start()
                     logger.info(f"AutoCode: 4h warn sent для {r.get('buyer')} (left={int(left)}s)")
 
-                # 30-минутное — узкое окно 25-30 минут
                 if (key not in warned_30m
                         and 1500 <= left <= 1800):
                     warned_30m.add(key)
@@ -1087,7 +1085,6 @@ def _expiry_watcher(cardinal):
                     ).start()
                     logger.info(f"AutoCode: 30m warn sent для {r.get('buyer')} (left={int(left)}s)")
 
-                # завершение
                 if now >= exp + 60:
                     Thread(
                         target=cardinal.send_message,
@@ -1109,24 +1106,15 @@ def _expiry_watcher(cardinal):
         except Exception as e:
             logger.error(f"Expiry watcher error: {e}")
 
-# ── Win-back worker ─────────────────────────────────────────────────────────
 def _winback_worker(cardinal):
-    """
-    Раз в день проверяет: есть ли покупатели, у которых аренда закончилась
-    3-30 дней назад, и мы им ещё не отправляли winback. Если есть — шлём.
-    """
-    time.sleep(120)  # подождать пока стартап завершится
+    time.sleep(120)
     while not _shutdown_flag["stop"]:
         try:
             settings = app_settings()
-            if not settings.get("winback_enabled", True):
-                pass
-            else:
-                # ищем по логу выдач: покупатели, которым последняя выдача была
-                # WINBACK_AFTER_DAYS - WINBACK_MAX_DAYS дней назад
+            if settings.get("winback_enabled", True):
                 entries = log_entries()
                 now = time.time()
-                last_by_buyer = {}  # buyer -> (last_ts, chat_id)
+                last_by_buyer = {}
                 for e in entries:
                     b = e.get("buyer")
                     if not b:
@@ -1142,14 +1130,13 @@ def _winback_worker(cardinal):
 
                 for buyer, (last_ts, cid) in last_by_buyer.items():
                     if buyer in active_buyers:
-                        continue  # уже активный — не трогаем
+                        continue
                     days_ago = (now - last_ts) / 86400
                     if days_ago < WINBACK_AFTER_DAYS or days_ago > WINBACK_MAX_DAYS:
                         continue
                     if buyer in sent_log:
                         continue
                     if not cid:
-                        # ищем chat_id из rentals (даже истёкших)
                         for r in rentals().values():
                             if r.get("buyer") == buyer and r.get("chat_id"):
                                 cid = r["chat_id"]
@@ -1179,15 +1166,12 @@ def _winback_worker(cardinal):
         except Exception as e:
             logger.error(f"Winback worker error: {e}")
 
-        # спим 24 часа
         for _ in range(86400):
             if _shutdown_flag["stop"]:
                 return
             time.sleep(1)
 
-# ── Review request (scheduled per code) ─────────────────────────────────────
 def _schedule_review_request(cardinal, chat_id, chat_name, buyer, lang):
-    """Через REVIEW_DELAY_SEC проверяем что аренда всё ещё активна и шлём просьбу отзыва."""
     def _send():
         if _shutdown_flag["stop"]:
             return
@@ -1195,7 +1179,6 @@ def _schedule_review_request(cardinal, chat_id, chat_name, buyer, lang):
             settings = app_settings()
             if not settings.get("review_enabled", True):
                 return
-            # проверка: покупатель ещё активен (не вернул деньги, не закрыл сделку)
             still_active = any(
                 r.get("buyer") == buyer and r.get("expires_at", 0) > time.time()
                 for r in rentals().values()
@@ -1212,9 +1195,7 @@ def _schedule_review_request(cardinal, chat_id, chat_name, buyer, lang):
     t_timer.daemon = True
     t_timer.start()
 
-# ── Backup worker ───────────────────────────────────────────────────────────
 def _backup_worker():
-    """Раз в день делает копию rentals.json и log.json в backups/."""
     while not _shutdown_flag["stop"]:
         for _ in range(86400):
             if _shutdown_flag["stop"]:
@@ -1229,7 +1210,6 @@ def _backup_worker():
                     dst = os.path.join(BACKUP_DIR, name)
                     with open(src, "rb") as f1, open(dst, "wb") as f2:
                         f2.write(f1.read())
-            # чистим старые бекапы (>14 дней)
             cutoff = time.time() - 14 * 86400
             for fname in os.listdir(BACKUP_DIR):
                 full = os.path.join(BACKUP_DIR, fname)
@@ -1242,7 +1222,6 @@ def _backup_worker():
         except Exception as e:
             logger.error(f"Backup worker error: {e}")
 
-# ── Parse hours from lot name ────────────────────────────────────────────────
 def _parse_hours(text: str) -> int | None:
     m = re.search(r"(\d+)\s*ч(?:ас(?:а|ов)?)?", text, re.IGNORECASE)
     if m:
@@ -1258,28 +1237,19 @@ def _parse_hours(text: str) -> int | None:
         return int(m.group(1)) * 24
     return None
 
-# ── Graceful shutdown ────────────────────────────────────────────────────────
 def _graceful_shutdown(*args):
     if _shutdown_flag["stop"]:
         return
     _shutdown_flag["stop"] = True
-    logger.info("AutoCode: graceful shutdown — сохраняю состояние...")
-    try:
-        # warned_state уже сохраняется внутри watcher'а, но на всякий случай —
-        # тут можно дописать другие финальные действия
-        # rentals/used/log сохраняются после каждого изменения, так что они в порядке
-        logger.info("AutoCode: завершено корректно.")
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+    logger.info("AutoCode: graceful shutdown.")
 
 atexit.register(_graceful_shutdown)
 try:
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
 except Exception:
-    pass  # на Windows SIGTERM не всегда работает
+    pass
 
-# ── on_new_order ─────────────────────────────────────────────────────────────
 def on_new_order(c, e: NewOrderEvent):
     global _cardinal_ref
     _cardinal_ref = c
@@ -1288,7 +1258,7 @@ def on_new_order(c, e: NewOrderEvent):
     lot_name = getattr(e.order, "lot_name", "") or desc
     hours    = _parse_hours(lot_name)
     if not hours:
-        logger.debug(f"AutoCode: не удалось определить часы из названия лота: {lot_name!r}")
+        logger.debug(f"AutoCode: не удалось определить часы: {lot_name!r}")
         return
 
     buyer     = getattr(e.order, "buyer_username", "") or ""
@@ -1317,7 +1287,6 @@ def on_new_order(c, e: NewOrderEvent):
             rents[k]["expires_at"] += hours * 3600
             rents[k]["hours"]      = rents[k].get("hours", 0) + hours
             save_rentals(rents)
-            # сбрасываем warned для этой аренды чтобы предупреждение пришло заново
             state = warned_state()
             for s_key in ("warned_4h", "warned_30m"):
                 if k in state.get(s_key, []):
@@ -1361,7 +1330,6 @@ def on_new_order(c, e: NewOrderEvent):
         daemon=True,
     ).start()
 
-# ── on_new_message ────────────────────────────────────────────────────────────
 def on_new_message(c, e: NewMessageEvent):
     global _cardinal_ref
     _cardinal_ref = c
@@ -1378,7 +1346,6 @@ def on_new_message(c, e: NewMessageEvent):
 
     lang = get_buyer_lang(buyer, text)
 
-    # update lang from current message if rental exists
     rents = rentals()
     rents_changed = False
     for k, r in rents.items():
@@ -1450,7 +1417,6 @@ def on_new_message(c, e: NewMessageEvent):
 
     _record_request(buyer)
 
-    # очередь: если уже есть запросы в обработке на эту почту, уведомляем
     q_size = _imap_queue.queue_size(acc_email)
     if q_size > 0:
         Thread(
@@ -1474,7 +1440,6 @@ def on_new_message(c, e: NewMessageEvent):
             ).start()
             return
 
-        # сохраняем used
         u = used_codes()
         u.setdefault(acc_email, []).append({"code": code_val, "used_at": time.time()})
         save_used(u)
@@ -1484,12 +1449,10 @@ def on_new_message(c, e: NewMessageEvent):
         msg = t(lang, "code_msg", code=code_val, dt=received_dt)
         Thread(target=c.send_message, args=(chat_id, msg, chat_name), daemon=True).start()
 
-        # запланировать просьбу отзыва через 30 минут
         _schedule_review_request(c, chat_id, chat_name, buyer, lang)
 
     _imap_queue.submit(acc_email, fetch_code, _on_result, acc, used, not_before_ts=not_before_ts)
 
-# ── Telegram UI ──────────────────────────────────────────────────────────────
 def init_autocode_tg(cardinal, *args):
     global _cardinal_ref
     _cardinal_ref = cardinal
@@ -1505,11 +1468,8 @@ def init_autocode_tg(cardinal, *args):
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_MAIN)
     def open_main(call: CallbackQuery):
-        bot.edit_message_text(f"⚙️ AutoCode v{VERSION} — выберите раздел:",
-                              call.message.chat.id, call.message.message_id,
-                              reply_markup=kb_main())
+        _safe_edit(bot, call, f"⚙️ AutoCode v{VERSION} — выберите раздел:", kb_main())
 
-    # ── Account list ──
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LIST}:"))
     def open_list(call: CallbackQuery):
         accs = accounts()
@@ -1521,8 +1481,7 @@ def init_autocode_tg(cardinal, *args):
             rows.append([B(f"{mark} 📧 {a['email']}", callback_data=f"{AC_EDIT}:{i}")])
         rows.append([B("➕ Добавить почту", callback_data=AC_ADD)])
         rows.append([B("◀ Назад", callback_data=AC_MAIN)])
-        bot.edit_message_text("📬 Почтовые аккаунты:", call.message.chat.id,
-                              call.message.message_id, reply_markup=K(keyboard=rows))
+        _safe_edit(bot, call, "📬 Почтовые аккаунты:", K(keyboard=rows))
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_ADD)
     def act_add(call: CallbackQuery):
@@ -1559,7 +1518,7 @@ def init_autocode_tg(cardinal, *args):
         idx = int(call.data.split(":")[1])
         accs = accounts()
         if idx >= len(accs):
-            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            _safe_answer(bot, call, "Аккаунт не найден.")
             return
         acc = accs[idx]
         health = health_state().get(acc["email"], {})
@@ -1589,7 +1548,7 @@ def init_autocode_tg(cardinal, *args):
             [B("🗑 Удалить",        callback_data=f"{AC_DEL_ASK}:{idx}")],
             [B("◀ Назад",           callback_data=f"{AC_LIST}:0")],
         ])
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+        _safe_edit(bot, call, text, kb)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ac_chpass:"))
     def act_chpass(call: CallbackQuery):
@@ -1611,7 +1570,7 @@ def init_autocode_tg(cardinal, *args):
         idx  = int(call.data.split(":")[1])
         accs = accounts()
         if idx >= len(accs):
-            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            _safe_answer(bot, call, "Аккаунт не найден.")
             return
         auto = detect_imap_host(accs[idx]["email"])
         msg  = bot.send_message(call.message.chat.id,
@@ -1636,10 +1595,9 @@ def init_autocode_tg(cardinal, *args):
         idx    = int(call.data.split(":")[1])
         accs   = accounts()
         if idx >= len(accs):
-            bot.answer_callback_query(call.id, "Аккаунт не найден.", show_alert=True)
+            _safe_answer(bot, call, "Аккаунт не найден.", show_alert=True)
             return
         result = test_imap(accs[idx])
-        # обновляем health
         h = health_state()
         h[accs[idx]["email"]] = {
             "last_check": time.time(),
@@ -1647,7 +1605,7 @@ def init_autocode_tg(cardinal, *args):
             "message":    result,
         }
         save_health(h)
-        bot.answer_callback_query(call.id, result, show_alert=True)
+        _safe_answer(bot, call, result, show_alert=True)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_DEL_ASK}:"))
     def ask_del(call: CallbackQuery):
@@ -1656,8 +1614,7 @@ def init_autocode_tg(cardinal, *args):
             [B("✅ Да, удалить", callback_data=f"{AC_DEL_OK}:{idx}"),
              B("❌ Отмена",      callback_data=f"{AC_LIST}:0")],
         ])
-        bot.edit_message_text("Удалить аккаунт?", call.message.chat.id,
-                              call.message.message_id, reply_markup=kb)
+        _safe_edit(bot, call, "Удалить аккаунт?", kb)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_DEL_OK}:"))
     def do_del(call: CallbackQuery):
@@ -1666,8 +1623,7 @@ def init_autocode_tg(cardinal, *args):
         if idx < len(accs):
             accs.pop(idx)
             save_accs(accs)
-        bot.edit_message_text("🗑 Удалён.", call.message.chat.id,
-                              call.message.message_id, reply_markup=kb_main())
+        _safe_edit(bot, call, "🗑 Удалён.", kb_main())
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LEN}:"))
     def act_len(call: CallbackQuery):
@@ -1694,14 +1650,14 @@ def init_autocode_tg(cardinal, *args):
         idx  = int(call.data.split(":")[1])
         accs = accounts()
         if idx >= len(accs):
-            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            _safe_answer(bot, call, "Аккаунт не найден.")
             return
         types = ["alnum", "digits", "alpha", "alnum-dash"]
         cur   = accs[idx].get("code_type", "alnum")
         nxt   = types[(types.index(cur) + 1) % len(types)] if cur in types else "alnum"
         accs[idx]["code_type"] = nxt
         save_accs(accs)
-        bot.answer_callback_query(call.id, f"Тип кода: {nxt}")
+        _safe_answer(bot, call, f"Тип кода: {nxt}")
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_FROM}:"))
     def act_from(call: CallbackQuery):
@@ -1724,21 +1680,19 @@ def init_autocode_tg(cardinal, *args):
         save_accs(accs)
         bot.send_message(message.chat.id, f"✅ {field} сохранён.")
 
-    # ── Lots ──
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOTS}:"))
     def open_lots(call: CallbackQuery):
         idx  = int(call.data.split(":")[1])
         accs = accounts()
         if idx >= len(accs):
-            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            _safe_answer(bot, call, "Аккаунт не найден.")
             return
         acc  = accs[idx]
         lots = acc.get("lot_ids", [])
         rows = [[B(f"🗑 {l}", callback_data=f"{AC_LOT_DEL}:{idx}:{l}")] for l in lots]
         rows.append([B("➕ Добавить лот", callback_data=f"{AC_LOT_ADD}:{idx}")])
         rows.append([B("◀ Назад",        callback_data=f"{AC_EDIT}:{idx}")])
-        bot.edit_message_text(f"Лоты для {acc['email']}:", call.message.chat.id,
-                              call.message.message_id, reply_markup=K(keyboard=rows))
+        _safe_edit(bot, call, f"Лоты для {acc['email']}:", K(keyboard=rows))
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOT_ADD}:"))
     def act_lot_add(call: CallbackQuery):
@@ -1761,13 +1715,12 @@ def init_autocode_tg(cardinal, *args):
         idx, lot = int(parts[1]), parts[2]
         accs = accounts()
         if idx >= len(accs):
-            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            _safe_answer(bot, call, "Аккаунт не найден.")
             return
         accs[idx]["lot_ids"] = [l for l in accs[idx].get("lot_ids", []) if l != lot]
         save_accs(accs)
-        bot.answer_callback_query(call.id, f"Лот {lot} удалён.")
+        _safe_answer(bot, call, f"Лот {lot} удалён.")
 
-    # ── Log ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_LOG)
     def open_log(call: CallbackQuery):
         entries = log_entries()[-30:]
@@ -1779,42 +1732,96 @@ def init_autocode_tg(cardinal, *args):
                 for e in reversed(entries)
             ]
             text = "📜 Последние выдачи:\n\n" + "\n".join(lines)
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-            reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]]))
+        _safe_edit(bot, call, text,
+            K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]]))
 
-    # ── Rentals ──
-    @bot.callback_query_handler(func=lambda c: c.data == AC_RENTALS)
+    # ── Rentals (компактные, с пагинацией) ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_RENTALS or c.data.startswith(f"{AC_RENT_PAGE}:"))
     def open_rentals(call: CallbackQuery):
-        active = get_active_rentals()
-        if not active:
-            text = "Нет активных аренд."
-            kb   = K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]])
-        else:
-            lines = [
-                f"👤 {r['buyer']} | до {_fmt_time(r['expires_at'])} | {r['email']} | {r.get('lang','ru')}"
-                + (" ⚠️" if not r.get("chat_id") else "")
-                for r in active
-            ]
-            rows = []
-            for r in active:
-                rows.append([
-                    B(f"🗑 {r['buyer']}", callback_data=f"{AC_RENT_DEL}:{r['order_key']}"),
-                    B("➕1ч",            callback_data=f"{AC_RENT_EXT}:{r['order_key']}:1"),
-                    B("➕24ч",           callback_data=f"{AC_RENT_EXT}:{r['order_key']}:24"),
-                ])
-            rows.append([B("◀ Назад", callback_data=AC_MAIN)])
-            text = "🏠 Активные аренды:\n\n" + "\n".join(lines)
-            text += "\n\n⚠️ = без chat_id (восстановлено, нет уведомлений)"
-            kb   = K(keyboard=rows)
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+        try:
+            page = int(call.data.split(":")[1]) if ":" in call.data else 0
+        except Exception:
+            page = 0
+
+        active = sorted(get_active_rentals(), key=lambda r: r.get("expires_at", 0))
+        total  = len(active)
+
+        if total == 0:
+            _safe_edit(bot, call, "🏠 Активные аренды\n\nНет активных аренд.",
+                K(keyboard=[[B("🔄 Обновить", callback_data=f"{AC_RENT_PAGE}:0"),
+                             B("◀ Назад",   callback_data=AC_MAIN)]]))
+            return
+
+        pages_total = (total + RENTALS_PAGE_SIZE - 1) // RENTALS_PAGE_SIZE
+        page = max(0, min(page, pages_total - 1))
+        start = page * RENTALS_PAGE_SIZE
+        chunk = active[start:start + RENTALS_PAGE_SIZE]
+
+        lines = [f"🏠 Активные аренды — стр. {page + 1}/{pages_total}",
+                 f"Всего: {total}\n"]
+        rows  = []
+        for r in chunk:
+            buyer    = (r.get("buyer") or "—")[:18]
+            remain   = _fmt_remaining_compact(r.get("expires_at", 0))
+            warn     = "⚠️" if not r.get("chat_id") else ""
+            lang     = r.get("lang", "ru")
+            lang_tag = "🇷🇺" if lang == "ru" else "🇬🇧"
+            lines.append(f"{lang_tag} {buyer} • ⏳{remain} {warn}")
+            # одна кнопка-управление на аренду — открывает карточку
+            rows.append([B(f"⚙️ {buyer}", callback_data=f"{AC_RENT_INFO}:{r['order_key']}")])
+
+        # пагинация
+        nav = []
+        if page > 0:
+            nav.append(B("◀", callback_data=f"{AC_RENT_PAGE}:{page - 1}"))
+        nav.append(B(f"🔄 {page + 1}/{pages_total}", callback_data=f"{AC_RENT_PAGE}:{page}"))
+        if page < pages_total - 1:
+            nav.append(B("▶", callback_data=f"{AC_RENT_PAGE}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+
+        rows.append([B("◀ Назад в меню", callback_data=AC_MAIN)])
+
+        lines.append("\n⚠️ = без chat_id (нет уведомлений)")
+        _safe_edit(bot, call, "\n".join(lines), K(keyboard=rows))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_INFO}:"))
+    def rent_info(call: CallbackQuery):
+        key = call.data.split(":", 1)[1]
+        rents = rentals()
+        r = rents.get(key)
+        if not r:
+            _safe_answer(bot, call, "Аренда не найдена.")
+            return
+        text = (
+            f"🏠 Аренда {r.get('buyer', '—')}\n\n"
+            f"📧 Почта: {r.get('email', '—')}\n"
+            f"📦 Лот: {r.get('lot_id', '—')}\n"
+            f"🌐 Язык: {r.get('lang', 'ru')}\n"
+            f"💬 chat_id: {r.get('chat_id') or '⚠️ нет'}\n"
+            f"🕐 Куплено: {_fmt_time(r.get('purchase_ts', 0))}\n"
+            f"⏰ Окончание: {_fmt_time(r.get('expires_at', 0))}\n"
+            f"⏳ Осталось: {_fmt_remaining(r.get('expires_at', 0))}\n"
+        )
+        kb = K(keyboard=[
+            [B("➕ 1ч",  callback_data=f"{AC_RENT_EXT}:{key}:1"),
+             B("➕ 6ч",  callback_data=f"{AC_RENT_EXT}:{key}:6"),
+             B("➕ 24ч", callback_data=f"{AC_RENT_EXT}:{key}:24")],
+            [B("🗑 Удалить",  callback_data=f"{AC_RENT_DEL}:{key}")],
+            [B("◀ К списку", callback_data=f"{AC_RENT_PAGE}:0")],
+        ])
+        _safe_edit(bot, call, text, kb)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_DEL}:"))
     def do_rent_del(call: CallbackQuery):
-        key   = call.data.split(":")[1]
+        key   = call.data.split(":", 1)[1]
         rents = rentals()
         rents.pop(key, None)
         save_rentals(rents)
-        bot.answer_callback_query(call.id, "Аренда удалена.")
+        _safe_answer(bot, call, "Аренда удалена.")
+        # вернуться в список
+        call.data = f"{AC_RENT_PAGE}:0"
+        open_rentals(call)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_EXT}:"))
     def do_rent_ext(call: CallbackQuery):
@@ -1825,36 +1832,48 @@ def init_autocode_tg(cardinal, *args):
             rents[key]["expires_at"] += hours * 3600
             rents[key]["hours"] = rents[key].get("hours", 0) + hours
             save_rentals(rents)
-            # сброс warned
             state = warned_state()
             for s_key in ("warned_4h", "warned_30m"):
                 if key in state.get(s_key, []):
                     state[s_key].remove(key)
             save_warned(state)
-        bot.answer_callback_query(call.id, f"Продлено на {hours}ч.")
+        _safe_answer(bot, call, f"Продлено на {hours}ч.")
+        # обновить карточку
+        call.data = f"{AC_RENT_INFO}:{key}"
+        rent_info(call)
 
     # ── Stats ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_STATS)
     def open_stats(call: CallbackQuery):
-        bot.edit_message_text("📊 Выберите период:", call.message.chat.id,
-                              call.message.message_id, reply_markup=kb_stats_period())
+        _safe_edit(bot, call, "📊 Выберите период:", kb_stats_period())
 
     @bot.callback_query_handler(func=lambda c: c.data in (
         AC_STATS_24H, AC_STATS_48H, AC_STATS_7D, AC_STATS_ALL
     ))
     def open_stats_period(call: CallbackQuery):
-        mapping = {
-            AC_STATS_24H: (24,   "24 часа"),
-            AC_STATS_48H: (48,   "48 часов"),
-            AC_STATS_7D:  (168,  "7 дней"),
-            AC_STATS_ALL: (None, "Всё время"),
-        }
-        hours, label = mapping[call.data]
-        entries = _filter_log_by_hours(hours)
-        bot.edit_message_text(
-            _stats_text(entries, label), call.message.chat.id, call.message.message_id,
-            reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_STATS)]]),
-        )
+        try:
+            mapping = {
+                AC_STATS_24H: (24,   "24 часа"),
+                AC_STATS_48H: (48,   "48 часов"),
+                AC_STATS_7D:  (168,  "7 дней"),
+                AC_STATS_ALL: (None, "Всё время"),
+            }
+            hours, label = mapping[call.data]
+            entries = _filter_log_by_hours(hours)
+            text = _stats_text(entries, label) if entries else (
+                f"📊 Статистика — {label}\n\nДанных за этот период нет."
+            )
+            kb = K(keyboard=[
+                [B("⏱ 24ч", callback_data=AC_STATS_24H),
+                 B("⏱ 48ч", callback_data=AC_STATS_48H)],
+                [B("📅 7д",  callback_data=AC_STATS_7D),
+                 B("📋 Всё", callback_data=AC_STATS_ALL)],
+                [B("◀ Назад", callback_data=AC_STATS)],
+            ])
+            _safe_edit(bot, call, text, kb)
+        except Exception as e:
+            logger.error(f"Stats button error: {e}")
+            _safe_answer(bot, call, f"Ошибка: {e}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_STATS_RANGE)
     def ask_stats_range(call: CallbackQuery):
@@ -1869,14 +1888,17 @@ def init_autocode_tg(cardinal, *args):
             dt = datetime.strptime(b.strip(), "%d.%m.%Y").replace(hour=23, minute=59, second=59)
             entries = _filter_log_by_range(df, dt)
             label   = f"{df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}"
-            bot.send_message(message.chat.id, _stats_text(entries, label),
+            text = _stats_text(entries, label) if entries else (
+                f"📊 Статистика — {label}\n\nДанных за этот период нет."
+            )
+            bot.send_message(message.chat.id, text,
                 reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_STATS)]]))
         except Exception:
             bot.send_message(message.chat.id,
                 "❌ Неверный формат. Пример: <code>01.05.2026-31.05.2026</code>",
                 parse_mode="HTML")
 
-    # ── Health check (вручную) ──
+    # ── Health ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_HEALTH)
     def open_health(call: CallbackQuery):
         accs = accounts()
@@ -1893,15 +1915,14 @@ def init_autocode_tg(cardinal, *args):
                 msg = h.get("message", "не проверялась")
                 lines.append(f"{mark} {a['email']}\n   {msg}\n   ⏱ {last_str}")
             text = "🩺 IMAP Health Check\n\n" + "\n\n".join(lines)
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-            reply_markup=K(keyboard=[
-                [B("🔄 Проверить сейчас", callback_data="ac_health_now")],
-                [B("◀ Назад", callback_data=AC_MAIN)],
-            ]))
+        _safe_edit(bot, call, text, K(keyboard=[
+            [B("🔄 Проверить сейчас", callback_data="ac_health_now")],
+            [B("◀ Назад", callback_data=AC_MAIN)],
+        ]))
 
     @bot.callback_query_handler(func=lambda c: c.data == "ac_health_now")
     def health_now(call: CallbackQuery):
-        bot.answer_callback_query(call.id, "Проверяю...")
+        _safe_answer(bot, call, "Проверяю...")
         accs = accounts()
         h = {}
         for a in accs:
@@ -1914,7 +1935,7 @@ def init_autocode_tg(cardinal, *args):
         save_health(h)
         open_health(call)
 
-    # ── Review settings ──
+    # ── Settings ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_REVIEW)
     def open_review(call: CallbackQuery):
         s = app_settings()
@@ -1924,7 +1945,7 @@ def init_autocode_tg(cardinal, *args):
             f"   Через 30 мин после выдачи кода.\n"
             f"   Шаблон: {s.get('review_template', '')[:80]}...\n\n"
             f"🔄 Win-back: {'✅ вкл' if s.get('winback_enabled', True) else '❌ выкл'}\n"
-            f"   Через {WINBACK_AFTER_DAYS}+ дней простоя, скидка {s.get('winback_discount', 25)}%.\n"
+            f"   Через {WINBACK_AFTER_DAYS}+ дней простоя.\n"
             f"   Шаблон: {s.get('winback_template', '')[:80]}..."
         )
         kb = K(keyboard=[
@@ -1934,15 +1955,14 @@ def init_autocode_tg(cardinal, *args):
              B("✏️ Шаблон win-back",   callback_data=AC_WB_TPL)],
             [B("◀ Назад", callback_data=AC_MAIN)],
         ])
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+        _safe_edit(bot, call, text, kb)
 
     @bot.callback_query_handler(func=lambda c: c.data == "ac_rev_toggle")
     def rev_toggle(call: CallbackQuery):
         s = app_settings()
         s["review_enabled"] = not s.get("review_enabled", True)
         save_settings(s)
-        bot.answer_callback_query(call.id,
-            f"Отзывы: {'вкл' if s['review_enabled'] else 'выкл'}")
+        _safe_answer(bot, call, f"Отзывы: {'вкл' if s['review_enabled'] else 'выкл'}")
         open_review(call)
 
     @bot.callback_query_handler(func=lambda c: c.data == "ac_rev_tpl")
@@ -1961,8 +1981,7 @@ def init_autocode_tg(cardinal, *args):
         s = app_settings()
         s["winback_enabled"] = not s.get("winback_enabled", True)
         save_settings(s)
-        bot.answer_callback_query(call.id,
-            f"Win-back: {'вкл' if s['winback_enabled'] else 'выкл'}")
+        _safe_answer(bot, call, f"Win-back: {'вкл' if s['winback_enabled'] else 'выкл'}")
         open_review(call)
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_WB_TPL)
@@ -2002,11 +2021,11 @@ def init_autocode_tg(cardinal, *args):
 
         text = (
             f"🔄 Win-back\n\n"
-            f"Кандидатов (неактивны 3-30 дней): <b>{len(candidates)}</b>\n"
+            f"Кандидатов (3-30 дн): <b>{len(candidates)}</b>\n"
             f"Уже отправлено: <b>{len(sent)}</b>\n\n"
         )
         if candidates:
-            text += "Топ-10 кандидатов:\n"
+            text += "Топ-10:\n"
             for b, d in sorted(candidates, key=lambda x: x[1])[:10]:
                 text += f"  • {b} — {int(d)} дн.\n"
 
@@ -2015,15 +2034,14 @@ def init_autocode_tg(cardinal, *args):
             [B("✏️ Шаблон", callback_data=AC_WB_TPL)],
             [B("◀ Назад", callback_data=AC_MAIN)],
         ])
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              reply_markup=kb, parse_mode="HTML")
+        _safe_edit(bot, call, text, kb, parse_mode="HTML")
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_WB_RUN)
     def wb_run(call: CallbackQuery):
-        bot.answer_callback_query(call.id, "Запущено...")
+        _safe_answer(bot, call, "Запущено...")
         Thread(target=_winback_manual_run, args=(cardinal,), daemon=True).start()
 
-    # ── Broadcast (без изменений по сути, но фильтр chat_id) ──
+    # ── Broadcast ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_BROADCAST)
     def open_broadcast(call: CallbackQuery):
         active = get_active_rentals()
@@ -2031,8 +2049,7 @@ def init_autocode_tg(cardinal, *args):
         text = (f"📢 Рассылка\n"
                 f"Активных аренд: <b>{len(active)}</b>\n"
                 f"Получат рассылку (с chat_id): <b>{with_chat}</b>")
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              reply_markup=kb_broadcast_menu(), parse_mode="HTML")
+        _safe_edit(bot, call, text, kb_broadcast_menu(), parse_mode="HTML")
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_SEND)
     def bcast_new(call: CallbackQuery):
@@ -2062,12 +2079,12 @@ def init_autocode_tg(cardinal, *args):
     def _do_broadcast(call, targets, is_retry=False):
         text = _bcast.get("text", "")
         if not text:
-            bot.answer_callback_query(call.id, "Текст не задан.")
+            _safe_answer(bot, call, "Текст не задан.")
             return
         if not targets:
-            bot.answer_callback_query(call.id, "Нет получателей.")
+            _safe_answer(bot, call, "Нет получателей.")
             return
-        bot.answer_callback_query(call.id, "Рассылка запущена...")
+        _safe_answer(bot, call, "Рассылка запущена...")
 
         pairs = targets if is_retry else [
             (r["chat_id"], r.get("chat_name", "")) for r in targets
@@ -2105,20 +2122,17 @@ def init_autocode_tg(cardinal, *args):
 
         Thread(target=_send_all, daemon=True).start()
 
-    # ── Templates ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_TPLS)
     def open_templates(call: CallbackQuery):
         tpls = templates()
         if not tpls:
-            bot.edit_message_text("Шаблонов нет.", call.message.chat.id,
-                call.message.message_id,
-                reply_markup=K(keyboard=[
+            _safe_edit(bot, call, "Шаблонов нет.",
+                K(keyboard=[
                     [B("➕ Добавить", callback_data=AC_BCAST_TPL_ADD)],
                     [B("◀ Назад",    callback_data=AC_BROADCAST)],
                 ]))
             return
-        bot.edit_message_text("📁 Шаблоны:", call.message.chat.id,
-                              call.message.message_id, reply_markup=kb_templates(tpls))
+        _safe_edit(bot, call, "📁 Шаблоны:", kb_templates(tpls))
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_TPL_ADD)
     def add_template(call: CallbackQuery):
@@ -2141,7 +2155,7 @@ def init_autocode_tg(cardinal, *args):
         idx  = int(call.data.split(":")[1])
         tpls = templates()
         if idx >= len(tpls):
-            bot.answer_callback_query(call.id, "Шаблон не найден.")
+            _safe_answer(bot, call, "Шаблон не найден.")
             return
         _bcast["text"] = tpls[idx]["text"]
         active = [r for r in get_active_rentals() if r.get("chat_id")]
@@ -2159,9 +2173,8 @@ def init_autocode_tg(cardinal, *args):
         if idx < len(tpls):
             tpls.pop(idx)
             save_templates(tpls)
-        bot.answer_callback_query(call.id, "Шаблон удалён.")
+        _safe_answer(bot, call, "Шаблон удалён.")
 
-    # ── Broadcast history ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_HIST)
     def open_bcast_hist(call: CallbackQuery):
         hist = bcast_history()[-20:]
@@ -2174,10 +2187,9 @@ def init_autocode_tg(cardinal, *args):
                 for h in reversed(hist)
             ]
             text = "📋 История рассылок:\n\n" + "\n\n".join(lines)
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-            reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_BROADCAST)]]))
+        _safe_edit(bot, call, text,
+            K(keyboard=[[B("◀ Назад", callback_data=AC_BROADCAST)]]))
 
-    # ── Scheduled broadcast ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_SCHED)
     def open_sched(call: CallbackQuery):
         msg = bot.send_message(call.message.chat.id, "Введите текст рассылки:")
@@ -2246,7 +2258,6 @@ def init_autocode_tg(cardinal, *args):
 
 
 def _winback_manual_run(cardinal):
-    """Manual win-back triggered from TG button."""
     try:
         settings = app_settings()
         entries = log_entries()
@@ -2302,7 +2313,6 @@ def _winback_manual_run(cardinal):
         logger.error(f"Manual winback error: {e}")
 
 
-# ── Plugin hooks ─────────────────────────────────────────────────────────────
 BIND_TO_PRE_INIT    = [init_autocode_tg]
 BIND_TO_NEW_ORDER   = [on_new_order]
 BIND_TO_NEW_MESSAGE = [on_new_message]

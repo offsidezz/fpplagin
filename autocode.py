@@ -1,17 +1,3 @@
-"""
-AutoCode v3 — плагин для FunPay Cardinal
-Автовыдача кодов с IMAP-почт по команде !cd.
-
-Логика:
-  1. Новый заказ (NewOrderEvent) → парсим название лота → извлекаем часы аренды
-     → ищем почту из текста автовыдачи → записываем покупателя в базу активных аренд
-  2. Покупатель пишет !cd → проверяем что он в базе и аренда не истекла
-     → ищем письмо на IMAP ТОЛЬКО после момента покупки → отдаём код
-  3. Фоновый поток каждую минуту проверяет истекшие аренды
-     → пишет покупателю "Аренда завершена, спасибо!" + предложение продлить
-  4. Уведомление в Telegram если код не найден
-  5. В Telegram-меню: активные аренды + скоро истекающие
-"""
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
@@ -27,6 +13,7 @@ import os
 import re
 import time
 import uuid as uuid_lib
+from collections import Counter
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from threading import Thread, Timer
@@ -41,102 +28,130 @@ from telebot.types import (
     CallbackQuery,
 )
 
-# ─── Метаданные ───────────────────────────────────────────────────────────────
-NAME        = "AutoCode"
-VERSION     = "4.0.0"
+NAME = "AutoCode"
+VERSION = "5.0.0"
+UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
-    "Авто-выдача кодов с IMAP-почт по команде !cd.\n"
-    "Триггер — новый заказ. Окно доступа считается с момента покупки.\n"
-    "Антидубль, лог, уведомления, авто-завершение аренды.\n"
+    "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
+    "Рассылка, аналитика, шаблоны, история рассылок, лимиты, авто-продление аренды.\n"
     "Команда: /autocode"
 )
-CREDITS        = "@offsidezq"
-UUID           = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
-SETTINGS_PAGE  = True
+CREDITS = "@offsidezq"
+SETTINGS_PAGE = True
 BIND_TO_DELETE = None
 
 logger = logging.getLogger("FPC.AutoCode")
 
-# ─── Callback-константы ───────────────────────────────────────────────────────
-AC_MAIN     = "AC_MAIN"
-AC_LIST     = "AC_LIST"
-AC_ADD      = "AC_ADD"
-AC_EDIT     = "AC_EDIT"
-AC_DEL_ASK  = "AC_DEL_ASK"
-AC_DEL_OK   = "AC_DEL_OK"
-AC_LOTS     = "AC_LOTS"
-AC_LOT_ADD  = "AC_LOT_ADD"
-AC_LOT_DEL  = "AC_LOT_DEL"
-AC_WINDOW   = "AC_WINDOW"
-AC_MAX_AGE  = "AC_MAX_AGE"
-AC_LEN      = "AC_LEN"
-AC_TYPE     = "AC_TYPE"
-AC_SPACES   = "AC_SPACES"
-AC_FROM     = "AC_FROM"
-AC_SUBJ     = "AC_SUBJ"
-AC_BODY     = "AC_BODY"
-AC_TEST     = "AC_TEST"
-AC_LOG          = "AC_LOG"
-AC_RENTALS      = "AC_RENTALS"
-AC_RENT_DEL     = "AC_RENT_DEL"
-AC_RENT_DEL_OK  = "AC_RENT_DEL_OK"
-AC_RENT_EXT     = "AC_RENT_EXT"   # продлить (+N часов)
-AC_RENT_EXT_DO  = "AC_RENT_EXT_DO"  # подтвердить продление
-AC_STATS        = "AC_STATS"
+# ── Callback constants ──────────────────────────────────────────────────────
+AC_MAIN          = "ac_main"
+AC_LIST          = "ac_list"
+AC_ADD           = "ac_add"
+AC_EDIT          = "ac_edit"
+AC_DEL_ASK       = "ac_del_ask"
+AC_DEL_OK        = "ac_del_ok"
+AC_LOTS          = "ac_lots"
+AC_LOT_ADD       = "ac_lot_add"
+AC_LOT_DEL       = "ac_lot_del"
+AC_WINDOW        = "ac_window"
+AC_MAX_AGE       = "ac_max_age"
+AC_LEN           = "ac_len"
+AC_TYPE          = "ac_type"
+AC_SPACES        = "ac_spaces"
+AC_FROM          = "ac_from"
+AC_SUBJ          = "ac_subj"
+AC_BODY          = "ac_body"
+AC_TEST          = "ac_test"
+AC_LOG           = "ac_log"
+AC_RENTALS       = "ac_rentals"
+AC_RENT_DEL      = "ac_rent_del"
+AC_RENT_DEL_OK   = "ac_rent_del_ok"
+AC_RENT_EXT      = "ac_rent_ext"
+AC_RENT_EXT_DO   = "ac_rent_ext_do"
+AC_STATS         = "ac_stats"
+AC_STATS_24H     = "ac_stats_24h"
+AC_STATS_48H     = "ac_stats_48h"
+AC_STATS_7D      = "ac_stats_7d"
+AC_STATS_ALL     = "ac_stats_all"
+AC_STATS_RANGE   = "ac_stats_range"
+AC_BROADCAST     = "ac_broadcast"
+AC_BCAST_SEND    = "ac_bcast_send"
+AC_BCAST_RETRY   = "ac_bcast_retry"
+AC_BCAST_TPLS    = "ac_bcast_tpls"
+AC_BCAST_TPL_USE = "ac_bcast_tpl_use"
+AC_BCAST_TPL_DEL = "ac_bcast_tpl_del"
+AC_BCAST_TPL_ADD = "ac_bcast_tpl_add"
+AC_BCAST_HIST    = "ac_bcast_hist"
+AC_BCAST_SCHED   = "ac_bcast_sched"
+AC_IMAP          = "ac_imap"
 
-# ─── Состояния ────────────────────────────────────────────────────────────────
-ST_EMAIL   = "AC_ST_EMAIL"
-ST_PASS    = "AC_ST_PASS"
-ST_IMAP    = "AC_ST_IMAP"
-ST_LOT_ADD = "AC_ST_LOT_ADD"
-ST_WINDOW  = "AC_ST_WINDOW"
-ST_MAX_AGE = "AC_ST_MAX_AGE"
-ST_LEN     = "AC_ST_LEN"
-ST_FROM    = "AC_ST_FROM"
-ST_SUBJ    = "AC_ST_SUBJ"
-ST_BODY    = "AC_ST_BODY"
+# ── Storage paths ───────────────────────────────────────────────────────────
+DATA_DIR        = "storage/autocode"
+ACCOUNTS_FILE   = os.path.join(DATA_DIR, "accounts.json")
+LOG_FILE        = os.path.join(DATA_DIR, "log.json")
+USED_FILE       = os.path.join(DATA_DIR, "used_codes.json")
+RENTALS_FILE    = os.path.join(DATA_DIR, "rentals.json")
+TEMPLATES_FILE  = os.path.join(DATA_DIR, "templates.json")
+BCAST_HIST_FILE = os.path.join(DATA_DIR, "broadcast_history.json")
 
-# ─── Хранилище ────────────────────────────────────────────────────────────────
-DATA_DIR      = "storage/autocode"
-ACCOUNTS_FILE = f"{DATA_DIR}/accounts.json"
-LOG_FILE      = f"{DATA_DIR}/log.json"
-USED_FILE     = f"{DATA_DIR}/used_codes.json"
-RENTALS_FILE  = f"{DATA_DIR}/rentals.json"   # активные аренды покупателей
+# ── IMAP auto-detect map ────────────────────────────────────────────────────
+IMAP_HOSTS = {
+    "gmail.com":      "imap.gmail.com",
+    "googlemail.com": "imap.gmail.com",
+    "outlook.com":    "imap-mail.outlook.com",
+    "hotmail.com":    "imap-mail.outlook.com",
+    "live.com":       "imap-mail.outlook.com",
+    "yandex.ru":      "imap.yandex.ru",
+    "yandex.com":     "imap.yandex.ru",
+    "ya.ru":          "imap.yandex.ru",
+    "mail.ru":        "imap.mail.ru",
+    "inbox.ru":       "imap.mail.ru",
+    "list.ru":        "imap.mail.ru",
+    "bk.ru":          "imap.mail.ru",
+}
 
+IMAP_TIMEOUT   = 15   # секунд на подключение
+CODE_CD        = 30   # кулдаун повторного запроса (сек)
+MAX_CODES_HOUR = 10   # лимит запросов в час на покупателя
+WARN_BEFORE_H  = 4    # предупреждение за N часов до конца аренды
+PRE_WINDOW     = 2 * 3600  # окно до покупки для поиска писем
 
+_cardinal_ref = None
+
+# ── Storage helpers ──────────────────────────────────────────────────────────
 def _ensure():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-
 def _load(path, default):
+    _ensure()
     if not os.path.exists(path):
         return default
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
-
 
 def _save(path, data):
     _ensure()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-def accounts():       return _load(ACCOUNTS_FILE, [])
-def save_accs(d):     _save(ACCOUNTS_FILE, d)
-def used_codes():     return _load(USED_FILE, {})
-def save_used(d):     _save(USED_FILE, d)
-def log_entries():    return _load(LOG_FILE, [])
-def rentals():        return _load(RENTALS_FILE, {})
-def save_rentals(d):  _save(RENTALS_FILE, d)
-
+def accounts():            return _load(ACCOUNTS_FILE, [])
+def save_accs(d):          _save(ACCOUNTS_FILE, d)
+def used_codes():          return _load(USED_FILE, {})
+def save_used(d):          _save(USED_FILE, d)
+def log_entries():         return _load(LOG_FILE, [])
+def rentals():             return _load(RENTALS_FILE, {})
+def save_rentals(d):       _save(RENTALS_FILE, d)
+def templates():           return _load(TEMPLATES_FILE, [])
+def save_templates(d):     _save(TEMPLATES_FILE, d)
+def bcast_history():       return _load(BCAST_HIST_FILE, [])
+def save_bcast_history(d): _save(BCAST_HIST_FILE, d)
 
 def add_log(email_addr, lot_id, buyer, code):
     entries = log_entries()
     entries.append({
-        "time":   datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        "time":   time.time(),
         "email":  email_addr,
         "lot_id": lot_id,
         "buyer":  buyer,
@@ -144,1201 +159,1036 @@ def add_log(email_addr, lot_id, buyer, code):
     })
     _save(LOG_FILE, entries[-200:])
 
+def _fmt_time(ts):
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
 
-# ─── Парсинг часов из названия лота ──────────────────────────────────────────
+def _fmt_remaining(ts):
+    left = max(0, int(ts - time.time()))
+    h, m = divmod(left // 60, 60)
+    return f"{h}ч {m:02d}мин"
 
-def parse_hours_from_lot(description: str) -> int | None:
-    """
-    Пробует вытащить количество часов из названия лота.
-    Примеры:
-      '🌸 NETFLIX Premium 4K 🌸 30 ДНЕЙ / 720ч' → 720
-      'Netflix 24ч аренда'                       → 24
-      'Netflix 1 день'                            → 24
-      'Netflix 7 дней'                            → 168
-      'Netflix 30 дней'                           → 720
-    """
-    # Прямо указаны часы: 720ч, 24ч, 48 ч
-    m = re.search(r"(\d+)\s*ч\b", description, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
+# ── IMAP host auto-detect ────────────────────────────────────────────────────
+def detect_imap_host(email_addr: str) -> str:
+    domain = email_addr.split("@")[-1].lower()
+    return IMAP_HOSTS.get(domain, f"imap.{domain}")
 
-    # Указаны дни: 30 дней, 7 дн, 1 день
-    m = re.search(r"(\d+)\s*д(ень|ня|ней|н\.?)\b", description, re.IGNORECASE)
-    if m:
-        return int(m.group(1)) * 24
-
-    return None
-
-
-# ─── Парсинг почты из текста автовыдачи ──────────────────────────────────────
-
-def parse_email_from_delivery(text: str) -> str | None:
-    """
-    Ищет email-адрес в тексте автовыдачи.
-    Например: 'email: secritos@yandex.ru' → 'secritos@yandex.ru'
-    """
-    m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
-    return m.group(0) if m else None
-
-
-# ─── IMAP логика ──────────────────────────────────────────────────────────────
-
+# ── Email parsing ────────────────────────────────────────────────────────────
 def _decode_str(value: str) -> str:
-    parts = email.header.decode_header(value or "")
-    out = []
+    parts = email.header.decode_header(value)
+    result = []
     for part, enc in parts:
         if isinstance(part, bytes):
-            out.append(part.decode(enc or "utf-8", errors="replace"))
+            result.append(part.decode(enc or "utf-8", errors="replace"))
         else:
-            out.append(str(part))
-    return "".join(out)
-
+            result.append(part)
+    return "".join(result)
 
 def _html_to_text(html: str) -> str:
-    """
-    Умно преобразует HTML в текст: удаляет теги, сохраняя переносы строк.
-    Блочные теги (<p>, <br>, <div>, <td>, <tr>) → новая строка.
-    """
-    # Блочные элементы → \n
-    html = re.sub(r"<(br|p|div|td|tr|li|h[1-6])[^>]*>", "\n", html, flags=re.IGNORECASE)
-    # Удаляем остальные теги
-    html = re.sub(r"<[^>]+>", "", html)
-    # HTML-энтити
-    html = html.replace("&nbsp;", " ").replace("&amp;", "&") \
-               .replace("&lt;", "<").replace("&gt;", ">") \
-               .replace("&#13;", "").replace("\r", "\n")
-    # Убираем пустые строки
-    lines = [l.strip() for l in html.splitlines()]
-    return "\n".join(l for l in lines if l)
-
+    return re.sub(r"<[^>]+>", " ", html)
 
 def _get_text(msg) -> tuple[str, str]:
-    """
-    Возвращает (plain_text, html_text) из письма.
-    html_text — очищенный текст HTML-части с сохранёнными переносами строк.
-    """
-    plain = ""
-    html  = ""
-
+    plain, html = "", ""
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
-            cs = part.get_content_charset() or "utf-8"
-            try:
-                payload = part.get_payload(decode=True).decode(cs, errors="replace")
-            except Exception:
-                continue
-            if ct == "text/plain" and not plain:
-                plain = payload
-            elif ct == "text/html" and not html:
-                html = _html_to_text(payload)
+            if ct == "text/plain":
+                plain += part.get_payload(decode=True).decode(
+                    part.get_content_charset() or "utf-8", errors="replace"
+                )
+            elif ct == "text/html":
+                html += part.get_payload(decode=True).decode(
+                    part.get_content_charset() or "utf-8", errors="replace"
+                )
     else:
-        cs  = msg.get_content_charset() or "utf-8"
-        ct  = msg.get_content_type()
-        try:
-            payload = msg.get_payload(decode=True).decode(cs, errors="replace")
-            if ct == "text/html":
-                html = _html_to_text(payload)
-            else:
-                plain = payload
-        except Exception:
-            pass
-
+        payload = msg.get_payload(decode=True)
+        if payload:
+            plain = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
     return plain, html
 
+def _find_code(plain, html, subj, acc) -> str | None:
+    code_type    = acc.get("code_type", "alnum")
+    code_len     = acc.get("code_len", 0)
+    allow_spaces = acc.get("allow_spaces", False)
 
-def _find_code(plain: str, html: str, subj: str, acc: dict) -> str | None:
-    """
-    Ищет код в письме.
-    plain — plain-text часть, html — очищенный HTML с переносами строк.
+    patterns = {
+        "digits":     r"\d",
+        "alpha":      r"[A-Za-z]",
+        "alnum":      r"[A-Za-z0-9]",
+        "alnum-dash": r"[A-Za-z0-9\-]",
+    }
+    char_cls = patterns.get(code_type, r"[A-Za-z0-9]")
+    if allow_spaces:
+        char_cls = f"(?:{char_cls}| )"
 
-    Стратегии по приоритету:
-      1. Отдельная строка состоящая только из цифр/букв (Netflix: '4626' отдельная строка в HTML)
-      2. Цифры/код рядом с ключевыми словами (код, code, вход, login, enter)
-      3. Первое подходящее число по длине в обоих частях
-    """
-    code_type = acc.get("code_type", "digits")
-    code_len  = int(acc.get("code_len", 0))
-    body_kw   = (acc.get("filter_body") or "").strip()
-
-    # Объединяем все источники
-    combined = (plain or "") + "\n" + (html or "") + "\n" + subj
-
-    # Фильтр по ключевому слову в body
-    if body_kw and body_kw.lower() not in combined.lower():
-        return None
-
-    # Паттерн для поиска кода
-    if code_type == "digits":
-        sym_pat = r"\d"
-        full_pat_len  = r"\b(\d{%d})\b" % code_len if code_len else None
-        full_pat_any  = r"\b(\d{4,8})\b"
-        line_re = r"^(\d+)$"
-    elif code_type == "alpha":
-        sym_pat = r"[A-Za-z]"
-        full_pat_len  = r"\b([A-Za-z]{%d})\b" % code_len if code_len else None
-        full_pat_any  = r"\b([A-Za-z]{4,12})\b"
-        line_re = r"^([A-Za-z]+)$"
-    elif code_type == "alnum-dash":
-        # Буквенно-цифровые коды с дефисом (пример: ABC-123, AB12-CD34)
-        sym_pat = r"[A-Za-z0-9\-]"
-        full_pat_len  = None  # длина со знаком - сложно точно, ищем по line_re
-        full_pat_any  = r"\b([A-Za-z0-9]{2,6}-[A-Za-z0-9]{2,8})\b"
-        line_re = r"^([A-Za-z0-9]+-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)$"
+    if code_len:
+        pat = re.compile(rf"\b{char_cls}{{{max(1, code_len - 2)},{code_len + 10}}}\b")
     else:
-        sym_pat = r"[A-Za-z0-9]"
-        full_pat_len  = r"\b([A-Za-z0-9]{%d})\b" % code_len if code_len else None
-        full_pat_any  = r"\b([A-Za-z0-9]{4,12})\b"
-        line_re = r"^([A-Za-z0-9]+)$"
+        pat = re.compile(rf"{char_cls}{{4,64}}")
 
-    def valid(c: str) -> bool:
-        if code_len and len(c) != code_len:
-            return False
-        return bool(re.match(f"^{sym_pat}+$", c))
+    text = plain or _html_to_text(html)
 
-    # ── Стратегия 1: отдельная строка целиком состоящая из нужных символов ──
-    # Работает и для plain, и для HTML (где код стоит отдельной строкой благодаря _html_to_text)
-    for source in [html, plain]:
-        if not source:
-            continue
-        for line in source.splitlines():
-            line = line.strip()
-            m = re.match(line_re, line)
-            if m and valid(m.group(1)):
-                return m.group(1)
+    # Strategy 1: standalone line
+    for line in text.splitlines():
+        line = line.strip()
+        if pat.fullmatch(line):
+            return line
 
-    # ── Стратегия 2: код рядом с ключевыми словами (в окне ±3 строк) ──
-    KW = re.compile(
-        r"(\bкод\b|\bcode\b|\benter\b|вход|login|otp|pin|verification|passcode)",
-        re.IGNORECASE
-    )
-    main_pat = re.compile(full_pat_len or full_pat_any)
-    lines = combined.splitlines()
-    for i, line in enumerate(lines):
-        if KW.search(line):
-            window = "\n".join(lines[max(0, i-3):i+4])
-            m = main_pat.search(window)
-            if m and valid(m.group(1)):
-                return m.group(1)
+    # Strategy 2: keyword proximity
+    keywords = ["код", "code", "ключ", "key", "enter", "активац"]
+    for kw in keywords:
+        idx = text.lower().find(kw)
+        if idx != -1:
+            snippet = text[idx:idx + 120]
+            m = pat.search(snippet)
+            if m:
+                return m.group()
 
-    # ── Стратегия 3: первое подходящее число/слово в обеих частях ──
-    found = main_pat.findall(combined)
-    for c in found:
-        if valid(c):
-            return c
+    # Strategy 3: first match
+    m = pat.search(text)
+    return m.group() if m else None
 
-    return None
+# ── IMAP fetch ───────────────────────────────────────────────────────────────
+def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
+    email_addr  = acc.get("email", "")
+    password    = acc.get("password", "")
+    imap_host   = acc.get("imap_host") or detect_imap_host(email_addr)
+    max_age     = acc.get("max_age_min", 60)
+    filter_from = acc.get("filter_from", "")
+    filter_subj = acc.get("filter_subj", "")
 
-
-def fetch_code(acc: dict, used: dict, not_before_ts: float | None = None) -> tuple[str | None, str | None]:
-    """
-    Подключается по IMAP, ищет свежий неиспользованный код.
-    not_before_ts — timestamp момента покупки, письма раньше него игнорируются.
-    Возвращает (код, None) или (None, текст_ошибки).
-    """
-    imap_host   = acc.get("imap") or "imap.mail.ru"
-    email_addr  = acc["email"]
-    password    = acc["password"]
-    filter_from = (acc.get("filter_from") or "").strip()
-    filter_subj = (acc.get("filter_subj") or "").strip()
-    max_age_min = int(acc.get("max_age_min", 60))
+    used_set = set(used.get(email_addr, []))
 
     try:
-        mail = imaplib.IMAP4_SSL(imap_host, timeout=10)
+        mail = imaplib.IMAP4_SSL(imap_host, timeout=IMAP_TIMEOUT)
         mail.login(email_addr, password)
         mail.select("INBOX")
-    except Exception as e:
-        return None, f"IMAP ошибка ({email_addr}): {e}"
 
-    try:
         if filter_from:
-            status, data = mail.search(None, "FROM", filter_from)
+            _, data = mail.search(None, "FROM", filter_from)
         else:
-            status, data = mail.search(None, "ALL")
-
-        if status != "OK" or not data[0]:
-            return None, None
+            _, data = mail.search(None, "ALL")
 
         msg_ids = data[0].split()
+        if not msg_ids:
+            mail.logout()
+            return None, "Входящих писем нет."
+
+        cutoff = time.time() - max_age * 60
+        if not_before_ts:
+            cutoff = min(cutoff, not_before_ts - PRE_WINDOW)
 
         for mid in reversed(msg_ids[-50:]):
             try:
-                status, msg_data = mail.fetch(mid, "(RFC822)")
-                if status != "OK":
-                    continue
-                msg = email.message_from_bytes(msg_data[0][1])
-
+                _, raw = mail.fetch(mid, "(RFC822)")
+                msg = email.message_from_bytes(raw[0][1])
                 date_str = msg.get("Date", "")
-                msg_ts = None
                 try:
-                    msg_dt = parsedate_to_datetime(date_str)
-                    msg_ts = msg_dt.timestamp()
+                    msg_ts = parsedate_to_datetime(date_str).timestamp()
                 except Exception:
-                    pass
-
-                # Принимаем письма до 2 часов ДО покупки — покупатель мог запросить
-                # код заранее чем оформить заказ (Netflix присылает код сразу)
-                PRE_WINDOW = 2 * 3600  # 2 часа до покупки
-                if not_before_ts and msg_ts and msg_ts < (not_before_ts - PRE_WINDOW):
                     continue
-
-                # Фильтр по возрасту — только если нет not_before_ts
-                if not not_before_ts and msg_ts and (time.time() - msg_ts) > max_age_min * 60:
+                if msg_ts < cutoff:
                     continue
-
                 subj = _decode_str(msg.get("Subject", ""))
                 if filter_subj and filter_subj.lower() not in subj.lower():
                     continue
-
                 plain, html = _get_text(msg)
                 code = _find_code(plain, html, subj, acc)
-                if not code:
-                    continue
-
-                # Антидубль
-                key = f"{email_addr}:{code}"
-                if key in used:
-                    continue
-
-                return code, None
-
-            except Exception as ex:
-                logger.warning(f"[AutoCode] Ошибка чтения письма: {ex}")
-                continue
-
-        return None, None
-
-    finally:
-        try:
-            mail.logout()
-        except Exception:
-            pass
-
-
-def test_imap(acc: dict) -> str:
-    """Returns connection status + info about the last matching letter."""
-    imap_host   = acc.get("imap") or "imap.mail.ru"
-    filter_subj = (acc.get("filter_subj") or "").strip()
-    filter_from = (acc.get("filter_from") or "").strip()
-    try:
-        mail = imaplib.IMAP4_SSL(imap_host, timeout=10)
-        mail.login(acc["email"], acc["password"])
-        mail.select("INBOX")
-        _, data = mail.search(None, "ALL")
-        ids = data[0].split() if data[0] else []
-        count = len(ids)
-
-        # Ищем последнее письмо подходящее по фильтрам
-        last_subj = "—"
-        last_date = "—"
-        last_from = "—"
-        for mid in reversed(ids[-50:]):
-            try:
-                _, msg_data = mail.fetch(mid, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1])
-                subj = _decode_str(msg.get("Subject", ""))
-                sender = _decode_str(msg.get("From", ""))
-                date_str = msg.get("Date", "")
-                if filter_subj and filter_subj.lower() not in subj.lower():
-                    continue
-                if filter_from and filter_from.lower() not in sender.lower():
-                    continue
-                # Нашли подходящее
-                last_subj = subj[:60] if subj else "—"
-                last_from = sender[:40] if sender else "—"
-                try:
-                    dt = parsedate_to_datetime(date_str)
-                    last_date = dt.strftime("%d.%m.%Y %H:%M")
-                except Exception:
-                    last_date = date_str[:20] if date_str else "—"
-                break
+                if code and code not in used_set:
+                    mail.logout()
+                    return code, None
             except Exception:
                 continue
 
         mail.logout()
-        return (
-            f"✅ <b>Подключено.</b> Писем в INBOX: {count}\n\n"
-            f"📨 <b>Последнее подходящее письмо:</b>\n"
-            f"   От: <code>{last_from}</code>\n"
-            f"   Тема: {last_subj}\n"
-            f"   Дата: {last_date}"
-        )
+        return None, "Подходящий код не найден в письмах."
+
+    except imaplib.IMAP4.error as e:
+        return None, f"IMAP ошибка: {e}"
+    except OSError as e:
+        return None, f"Сервер недоступен (таймаут {IMAP_TIMEOUT}с): {e}"
+    except Exception as e:
+        return None, f"Ошибка: {e}"
+
+def test_imap(acc) -> str:
+    host = acc.get("imap_host") or detect_imap_host(acc.get("email", ""))
+    try:
+        mail = imaplib.IMAP4_SSL(host, timeout=IMAP_TIMEOUT)
+        mail.login(acc["email"], acc["password"])
+        mail.select("INBOX")
+        mail.logout()
+        return f"✅ Подключение успешно ({host})"
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-
-# ─── Вспомогательные функции аренд ───────────────────────────────────────────
-
-def get_active_rentals() -> list[dict]:
-    """Возвращает список активных (не истекших) аренд."""
+# ── Rental helpers ───────────────────────────────────────────────────────────
+def get_active_rentals() -> list:
     now = time.time()
-    return [r for r in rentals().values() if r["expires_at"] > now]
+    return [r for r in rentals().values() if r.get("expires_at", 0) > now]
 
-
-def get_expiring_rentals(within_hours: float = 2.0) -> list[dict]:
-    """Аренды, истекающие в ближайшие within_hours часов."""
+def get_expiring_rentals(within_hours: float) -> list:
     now = time.time()
-    threshold = now + within_hours * 3600
-    return [r for r in rentals().values()
-            if now < r["expires_at"] <= threshold]
-
-
-def _fmt_time(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
-
-
-def _fmt_remaining(ts: float) -> str:
-    secs = int(ts - time.time())
-    if secs <= 0:
-        return "истекла"
-    h, m = divmod(secs // 60, 60)
-    return f"{h}ч {m}м"
-
-
-# ─── Клавиатуры ───────────────────────────────────────────────────────────────
-
-def kb_main() -> K:
-    return (
-        K()
-        .add(B("📬 Список почт",    callback_data=f"{AC_LIST}:0"))
-        .add(B("🏠 Активные аренды", callback_data=AC_RENTALS))
-        .add(B("📜 Лог выдач",      callback_data=AC_LOG))
-        .add(B("📊 Статистика",       callback_data=AC_STATS))
-    )
-
-
-def kb_list(accs: list) -> K:
-    kb = K()
-    for i, a in enumerate(accs):
-        kb.add(B(f"✏️ {a['email']}", callback_data=f"{AC_EDIT}:{i}"))
-    kb.add(B("➕ Добавить почту", callback_data=AC_ADD))
-    kb.add(B("◀️ Назад",         callback_data=AC_MAIN))
-    return kb
-
-
-def _type_label(t):
-    return {"digits": "Цифры", "alpha": "Буквы", "alnum": "Буквы+Цифры", "alnum-dash": "XXX-000"}.get(t, "Цифры")
-
-
-def kb_edit(idx: int, acc: dict) -> K:
-    kb = K()
-    kb.add(
-        B(f"🕐 Возраст: {acc.get('max_age_min',60)}м", callback_data=f"{AC_MAX_AGE}:{idx}"),
-        B(f"🔢 Длина: {acc.get('code_len',0) or 'любая'}", callback_data=f"{AC_LEN}:{idx}"),
-    )
-    kb.add(
-        B(f"🔡 Тип: {_type_label(acc.get('code_type','digits'))}", callback_data=f"{AC_TYPE}:{idx}"),
-        B(f"␣ Пробелы: {'Да' if acc.get('remove_spaces',True) else 'Нет'}", callback_data=f"{AC_SPACES}:{idx}"),
-    )
-    kb.add(
-        B(f"📨 От: {acc.get('filter_from') or '—'}",    callback_data=f"{AC_FROM}:{idx}"),
-        B(f"📌 Тема: {acc.get('filter_subj') or '—'}", callback_data=f"{AC_SUBJ}:{idx}"),
-    )
-    kb.add(B(f"📝 Body: {acc.get('filter_body') or '—'}", callback_data=f"{AC_BODY}:{idx}"))
-    kb.add(B("🔌 Тест почты",      callback_data=f"{AC_TEST}:{idx}"))
-    kb.add(B("🗑 Удалить аккаунт", callback_data=f"{AC_DEL_ASK}:{idx}"))
-    kb.add(B("◀️ Назад",           callback_data=f"{AC_LIST}:0"))
-    return kb
-
-
-def _edit_text(idx: int, acc: dict) -> str:
-    return (
-        f"⚙️ <b>{acc['email']}</b>\n\n"
-        f"🌐 IMAP: <code>{acc.get('imap','imap.mail.ru')}</code>\n"
-        f"🕐 Макс. возраст кода: {acc.get('max_age_min',60)} мин.\n"
-        f"🔢 Длина кода: {acc.get('code_len',0) or 'любая'}\n"
-        f"🔡 Тип кода: {_type_label(acc.get('code_type','digits'))}\n"
-        f"␣ Пробелы убирать: {'Да' if acc.get('remove_spaces',True) else 'Нет'}\n"
-        f"📨 Фильтр from: {acc.get('filter_from') or '—'}\n"
-        f"📌 Фильтр subj: {acc.get('filter_subj') or '—'}\n"
-        f"📝 Фильтр body: {acc.get('filter_body') or '—'}\n"
-    )
-
-
-def kb_confirm_del(idx: int) -> K:
-    return K().row(
-        B("✅ Удалить", callback_data=f"{AC_DEL_OK}:{idx}"),
-        B("❌ Отмена",  callback_data=f"{AC_EDIT}:{idx}"),
-    )
-
-
-def kb_lots(idx: int, acc: dict) -> K:
-    kb = K()
-    for lid in acc.get("lot_ids", []):
-        kb.add(B(f"❌ {lid}", callback_data=f"{AC_LOT_DEL}:{idx}:{lid}"))
-    kb.add(B("➕ Добавить лот ID", callback_data=f"{AC_LOT_ADD}:{idx}"))
-    kb.add(B("◀️ Назад",          callback_data=f"{AC_EDIT}:{idx}"))
-    return kb
-
-
-def kb_type(idx: int) -> K:
-    return (
-        K()
-        .add(B("🔢 Цифры",        callback_data=f"{AC_TYPE}:{idx}:digits"))
-        .add(B("🔡 Буквы",        callback_data=f"{AC_TYPE}:{idx}:alpha"))
-        .add(B("🔣 Буквы+Цифры",  callback_data=f"{AC_TYPE}:{idx}:alnum"))
-        .add(B("🔑 XXX-000 (дефис)", callback_data=f"{AC_TYPE}:{idx}:alnum-dash"))
-        .add(B("◀️ Назад",        callback_data=f"{AC_EDIT}:{idx}"))
-    )
-
-
-def kb_cancel(cb: str) -> K:
-    return K().add(B("❌ Отмена", callback_data=cb))
-
-
-# ─── Telegram UI ──────────────────────────────────────────────────────────────
-
-# Глобальная ссылка на Cardinal для фонового потока
-_cardinal_ref: Cardinal | None = None
-
-
-def init_autocode_tg(cardinal: Cardinal, *args):
-    global _cardinal_ref
-    _cardinal_ref = cardinal
-    _ensure()
-
-    tg  = cardinal.telegram
-    bot = tg.bot
-
-    def acc_by(idx):
-        a = accounts()
-        return a[idx] if 0 <= idx < len(a) else None
-
-    # ── Главное меню ─────────────────────────────────────────────────────────
-
-    def show_main(chat_id, msg_id):
-        active = len(get_active_rentals())
-        expiring = len(get_expiring_rentals(2))
-        text = (
-            "⚙️ <b>AutoCode v4</b>\n\n"
-            f"🏠 Активных аренд: <b>{active}</b>\n"
-            f"⚠️ Истекают в ближайшие 2ч: <b>{expiring}</b>\n\n"
-            "Выдача кодов по команде <code>!cd</code> в чате FunPay.\n"
-            "Триггер — оплата заказа. Окно считается с момента покупки."
-        )
-        bot.edit_message_text(text, chat_id, msg_id,
-                              reply_markup=kb_main(), parse_mode="HTML")
-
-    def open_main(c: CallbackQuery):
-        show_main(c.message.chat.id, c.message.id)
-        bot.answer_callback_query(c.id)
-
-    def open_plugin_settings(c: CallbackQuery):
-        show_main(c.message.chat.id, c.message.id)
-        bot.answer_callback_query(c.id)
-
-    # ── Активные аренды ──────────────────────────────────────────────────────
-
-    def _rentals_text_kb():
-        """Build rentals list text + inline keyboard with extend/delete buttons."""
-        rents = rentals()
-        now_ts = time.time()
-        active = [(k, r) for k, r in rents.items() if r["expires_at"] > now_ts]
-        active.sort(key=lambda x: x[1]["expires_at"])
-        expiring_keys = {k for k, r in active if (r["expires_at"] - now_ts) <= 7200}
-        if not active:
-            return "🏠 <b>Активных аренд нет.</b>", K().add(B("◀️ Назад", callback_data=AC_MAIN))
-        lines = []
-        kb = K()
-        for ok, r in active:
-            warn = "⚠️ " if ok in expiring_keys else ""
-            lines.append(
-                f"{warn}👤 <b>{r['buyer']}</b> (заказ {r.get('order_id', ok)})\n"
-                f"   📧 {r['email']}\n"
-                f"   ⏳ Осталось: {_fmt_remaining(r['expires_at'])} | До: {_fmt_time(r['expires_at'])}"
-            )
-            kb.add(
-                B(f"➕ +24ч  {r['buyer'][:14]}", callback_data=f"{AC_RENT_EXT}:{ok}:24"),
-                B("🗑 Удалить",                  callback_data=f"{AC_RENT_DEL}:{ok}"),
-            )
-        kb.add(B("◀️ Назад", callback_data=AC_MAIN))
-        return f"🏠 <b>Активные аренды ({len(active)}):</b>\n\n" + "\n\n".join(lines), kb
-
-    def open_rentals(c: CallbackQuery):
-        text, kb = _rentals_text_kb()
-        bot.edit_message_text(text, c.message.chat.id, c.message.id,
-                              reply_markup=kb, parse_mode="HTML")
-        bot.answer_callback_query(c.id)
-
-    def do_rent_del(c: CallbackQuery):
-        """Ask confirmation before deleting a rental."""
-        ok = c.data.split(":", 1)[1]
-        r = rentals().get(ok)
-        if not r:
-            bot.answer_callback_query(c.id, "Аренда не найдена", show_alert=True)
-            return
-        kb = K().row(
-            B("✅ Да, удалить", callback_data=f"{AC_RENT_DEL_OK}:{ok}"),
-            B("❌ Отмена",       callback_data=AC_RENTALS),
-        )
-        bot.edit_message_text(
-            f"⚠️ Удалить аренду <b>{r['buyer']}</b>?\n"
-            f"⏳ Осталось: {_fmt_remaining(r['expires_at'])}",
-            c.message.chat.id, c.message.id, reply_markup=kb, parse_mode="HTML"
-        )
-        bot.answer_callback_query(c.id)
-
-    def do_rent_del_ok(c: CallbackQuery):
-        ok = c.data.split(":", 1)[1]
-        rents = rentals()
-        buyer_name = rents.get(ok, {}).get("buyer", ok)
-        if ok in rents:
-            del rents[ok]
-            save_rentals(rents)
-        bot.answer_callback_query(c.id, f"✅ Аренда {buyer_name} удалена")
-        text2, kb2 = _rentals_text_kb()
-        bot.edit_message_text(text2, c.message.chat.id, c.message.id,
-                              reply_markup=kb2, parse_mode="HTML")
-
-    def do_rent_ext(c: CallbackQuery):
-        """Manually extend a rental by N hours."""
-        parts = c.data.split(":")
-        ok    = parts[1]
-        hours = int(parts[2]) if len(parts) > 2 else 24
-        rents = rentals()
-        if ok not in rents:
-            bot.answer_callback_query(c.id, "Аренда не найдена", show_alert=True)
-            return
-        rents[ok]["expires_at"] += hours * 3600
-        rents[ok]["hours"] = rents[ok].get("hours", 0) + hours
-        save_rentals(rents)
-        r = rents[ok]
-        bot.answer_callback_query(
-            c.id,
-            f"✅ Аренда {r['buyer']} продлена на {hours}ч.\nТеперь до: {_fmt_time(r['expires_at'])}",
-            show_alert=True
-        )
-        text3, kb3 = _rentals_text_kb()
-        bot.edit_message_text(text3, c.message.chat.id, c.message.id,
-                              reply_markup=kb3, parse_mode="HTML")
-
-    # ── Список почт ──────────────────────────────────────────────────────────
-
-    def open_list(c: CallbackQuery):
-        accs = accounts()
-        text = f"📬 Подключённые почты (Всего: {len(accs)}):"
-        if not accs:
-            text += "\n\nПочт ещё нет."
-        bot.edit_message_text(text, c.message.chat.id, c.message.id,
-                              reply_markup=kb_list(accs), parse_mode="HTML")
-        bot.answer_callback_query(c.id)
-
-    # ── Добавление почты ─────────────────────────────────────────────────────
-
-    def act_add(c: CallbackQuery):
-        msg = bot.send_message(
-            c.message.chat.id,
-            "📧 <b>Шаг 1/3</b> — Введите Email:",
-            reply_markup=kb_cancel(f"{AC_LIST}:0"), parse_mode="HTML"
-        )
-        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, ST_EMAIL)
-        bot.answer_callback_query(c.id)
-
-    def got_email(m: Message):
-        v = m.text.strip()
-        tg.clear_state(m.chat.id, m.from_user.id, del_msg=True)
-        msg = bot.send_message(
-            m.chat.id,
-            f"🔑 <b>Шаг 2/3</b> — Пароль приложений (IMAP) для {v}:",
-            reply_markup=kb_cancel(f"{AC_LIST}:0"), parse_mode="HTML"
-        )
-        tg.set_state(m.chat.id, msg.id, m.from_user.id, ST_PASS, {"email": v})
-
-    def got_pass(m: Message):
-        st = tg.get_state(m.chat.id, m.from_user.id)["data"]
-        st["password"] = m.text.strip()
-        tg.clear_state(m.chat.id, m.from_user.id, del_msg=True)
-        msg = bot.send_message(
-            m.chat.id,
-            "🌐 <b>Шаг 3/3</b> — IMAP сервер\n"
-            "(<code>-</code> = <code>imap.mail.ru</code>):",
-            reply_markup=kb_cancel(f"{AC_LIST}:0"), parse_mode="HTML"
-        )
-        tg.set_state(m.chat.id, msg.id, m.from_user.id, ST_IMAP, st)
-
-    def got_imap(m: Message):
-        st = tg.get_state(m.chat.id, m.from_user.id)["data"]
-        tg.clear_state(m.chat.id, m.from_user.id, del_msg=True)
-        imap_val = m.text.strip()
-        if imap_val == "-":
-            imap_val = "imap.mail.ru"
-        accs = accounts()
-        accs.append({
-            "email": st["email"], "password": st["password"], "imap": imap_val,
-            "lot_ids": [], "max_age_min": 60,
-            "code_len": 0, "code_type": "digits", "remove_spaces": True,
-            "filter_from": "", "filter_subj": "", "filter_body": "",
-        })
-        save_accs(accs)
-        idx = len(accs) - 1
-        bot.send_message(
-            m.chat.id,
-            f"✅ Почта <b>{accs[idx]['email']}</b> добавлена!",
-            reply_markup=kb_edit(idx, accs[idx]), parse_mode="HTML"
-        )
-
-    # ── Редактирование ───────────────────────────────────────────────────────
-
-    def open_edit(c: CallbackQuery):
-        idx = int(c.data.split(":")[1])
-        acc = acc_by(idx)
-        if not acc:
-            bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
-            return
-        bot.edit_message_text(_edit_text(idx, acc), c.message.chat.id, c.message.id,
-                              reply_markup=kb_edit(idx, acc), parse_mode="HTML")
-        bot.answer_callback_query(c.id)
-
-    # ── Удаление ─────────────────────────────────────────────────────────────
-
-    def ask_del(c: CallbackQuery):
-        idx = int(c.data.split(":")[1])
-        acc = acc_by(idx)
-        if not acc:
-            bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
-            return
-        bot.edit_message_text(f"⚠️ Удалить <b>{acc['email']}</b>?",
-                              c.message.chat.id, c.message.id,
-                              reply_markup=kb_confirm_del(idx), parse_mode="HTML")
-        bot.answer_callback_query(c.id)
-
-    def do_del(c: CallbackQuery):
-        idx = int(c.data.split(":")[1])
-        accs = accounts()
-        if 0 <= idx < len(accs):
-            accs.pop(idx)
-            save_accs(accs)
-        bot.edit_message_text("✅ Удалено.", c.message.chat.id, c.message.id,
-                              reply_markup=kb_list(accounts()))
-        bot.answer_callback_query(c.id)
-
-    # ── Лоты ─────────────────────────────────────────────────────────────────
-
-    def open_lots(c: CallbackQuery):
-        idx = int(c.data.split(":")[1])
-        acc = acc_by(idx)
-        if not acc:
-            bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
-            return
-        bot.edit_message_text(
-            f"🗂 <b>Лоты для {acc['email']}</b>\n\nID лота — число из URL лота на FunPay.",
-            c.message.chat.id, c.message.id,
-            reply_markup=kb_lots(idx, acc), parse_mode="HTML"
-        )
-        bot.answer_callback_query(c.id)
-
-    def act_lot_add(c: CallbackQuery):
-        idx = int(c.data.split(":")[1])
-        msg = bot.send_message(
-            c.message.chat.id,
-            "🆔 Введите <b>ID лота</b> (число из URL на FunPay):",
-            reply_markup=kb_cancel(f"{AC_LOTS}:{idx}"), parse_mode="HTML"
-        )
-        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, ST_LOT_ADD, {"idx": idx})
-        bot.answer_callback_query(c.id)
-
-    def got_lot_id(m: Message):
-        st  = tg.get_state(m.chat.id, m.from_user.id)
-        idx = st["data"]["idx"]
-        tg.clear_state(m.chat.id, m.from_user.id, del_msg=True)
-        lid = m.text.strip()
-        if not lid.isdigit():
-            bot.send_message(m.chat.id, "❌ ID должен быть числом.")
-            return
-        accs = accounts()
-        if 0 <= idx < len(accs):
-            if lid not in accs[idx].setdefault("lot_ids", []):
-                accs[idx]["lot_ids"].append(lid)
-                save_accs(accs)
-            bot.send_message(m.chat.id, f"✅ Лот <code>{lid}</code> добавлен.",
-                             reply_markup=kb_lots(idx, accs[idx]), parse_mode="HTML")
-
-    def do_lot_del(c: CallbackQuery):
-        parts = c.data.split(":")
-        idx, lid = int(parts[1]), parts[2]
-        accs = accounts()
-        if 0 <= idx < len(accs):
-            accs[idx]["lot_ids"] = [x for x in accs[idx].get("lot_ids", []) if x != lid]
-            save_accs(accs)
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.id,
-                                          reply_markup=kb_lots(idx, accs[idx]))
-        bot.answer_callback_query(c.id, f"Лот {lid} удалён")
-
-    # ── Числовые настройки ───────────────────────────────────────────────────
-
-    def _ask_num(c: CallbackQuery, state: str, prompt: str):
-        idx = int(c.data.split(":")[1])
-        msg = bot.send_message(c.message.chat.id, prompt,
-                               reply_markup=kb_cancel(f"{AC_EDIT}:{idx}"), parse_mode="HTML")
-        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, state, {"idx": idx})
-        bot.answer_callback_query(c.id)
-
-    def act_age(c):  _ask_num(c, ST_MAX_AGE, "🕐 Введите <b>макс. возраст кода в минутах</b> (например: 60):")
-    def act_len(c):  _ask_num(c, ST_LEN,     "🔢 Введите <b>длину кода</b> (0 = любая):")
-
-    def _got_num(m: Message, state_key: str, field: str, label: str):
-        st = tg.get_state(m.chat.id, m.from_user.id)
-        if not st or st["state"] != state_key:
-            return
-        idx = st["data"]["idx"]
-        tg.clear_state(m.chat.id, m.from_user.id, del_msg=True)
-        if not m.text.strip().isdigit():
-            bot.send_message(m.chat.id, "❌ Введите число.")
-            return
-        accs = accounts()
-        if 0 <= idx < len(accs):
-            accs[idx][field] = int(m.text.strip())
-            save_accs(accs)
-            bot.send_message(m.chat.id, f"✅ {label}: <b>{m.text.strip()}</b>",
-                             reply_markup=kb_edit(idx, accs[idx]), parse_mode="HTML")
-
-    def got_age(m):  _got_num(m, ST_MAX_AGE, "max_age_min", "Макс. возраст (мин.)")
-    def got_len(m):  _got_num(m, ST_LEN,     "code_len",    "Длина кода")
-
-    # ── Тип кода ─────────────────────────────────────────────────────────────
-
-    def open_type(c: CallbackQuery):
-        parts = c.data.split(":")
-        idx = int(parts[1])
-        if len(parts) == 3:
-            accs = accounts()
-            if 0 <= idx < len(accs):
-                accs[idx]["code_type"] = parts[2]
-                save_accs(accs)
-                bot.edit_message_reply_markup(c.message.chat.id, c.message.id,
-                                              reply_markup=kb_edit(idx, accs[idx]))
-            bot.answer_callback_query(c.id, "✅ Сохранено")
-        else:
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.id,
-                                          reply_markup=kb_type(idx))
-            bot.answer_callback_query(c.id)
-
-    # ── Пробелы ──────────────────────────────────────────────────────────────
-
-    def toggle_spaces(c: CallbackQuery):
-        idx = int(c.data.split(":")[1])
-        accs = accounts()
-        if 0 <= idx < len(accs):
-            accs[idx]["remove_spaces"] = not accs[idx].get("remove_spaces", True)
-            save_accs(accs)
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.id,
-                                          reply_markup=kb_edit(idx, accs[idx]))
-        bot.answer_callback_query(c.id)
-
-    # ── Текстовые фильтры ────────────────────────────────────────────────────
-
-    def _ask_text(c: CallbackQuery, state_key: str, prompt: str):
-        idx = int(c.data.split(":")[1])
-        msg = bot.send_message(c.message.chat.id, prompt,
-                               reply_markup=kb_cancel(f"{AC_EDIT}:{idx}"), parse_mode="HTML")
-        tg.set_state(c.message.chat.id, msg.id, c.from_user.id, state_key, {"idx": idx})
-        bot.answer_callback_query(c.id)
-
-    def act_from(c): _ask_text(c, ST_FROM, "📨 Фильтр <b>отправителя (from)</b> (<code>-</code> = очистить):")
-    def act_subj(c): _ask_text(c, ST_SUBJ, "📌 Фильтр <b>темы (subj)</b> (<code>-</code> = очистить):")
-    def act_body(c): _ask_text(c, ST_BODY, "📝 <b>Ключевое слово в теле</b> (<code>-</code> = очистить):")
-
-    def _got_text(m: Message, state_key: str, field: str, label: str):
-        st = tg.get_state(m.chat.id, m.from_user.id)
-        if not st or st["state"] != state_key:
-            return
-        idx = st["data"]["idx"]
-        tg.clear_state(m.chat.id, m.from_user.id, del_msg=True)
-        val = m.text.strip()
-        if val == "-":
-            val = ""
-        accs = accounts()
-        if 0 <= idx < len(accs):
-            accs[idx][field] = val
-            save_accs(accs)
-            bot.send_message(m.chat.id, f"✅ {label}: <b>{val or '(очищен)'}</b>",
-                             reply_markup=kb_edit(idx, accs[idx]), parse_mode="HTML")
-
-    def got_from(m): _got_text(m, ST_FROM, "filter_from", "Фильтр from")
-    def got_subj(m): _got_text(m, ST_SUBJ, "filter_subj", "Фильтр subj")
-    def got_body(m): _got_text(m, ST_BODY, "filter_body", "Ключ. слово body")
-
-    # ── Тест ─────────────────────────────────────────────────────────────────
-
-    def do_test(c: CallbackQuery):
-        idx = int(c.data.split(":")[1])
-        acc = acc_by(idx)
-        if not acc:
-            bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
-            return
-        bot.answer_callback_query(c.id, "⏳ Проверяю...")
-
-        def run():
-            # Проверка подключения
-            conn_result = test_imap(acc)
-
-            # Поиск последнего доступного кода (без антидубля — только для превью)
-            code, err = fetch_code(acc, {}, not_before_ts=None)
-
-            if code:
-                code_line = f"🔑 Последний доступный код: <code>{code}</code>"
-            elif err:
-                code_line = f"❌ Ошибка поиска: {err}"
-            else:
-                code_line = "📩 Подходящего письма с кодом не найдено"
-
-            bot.send_message(
-                c.message.chat.id,
-                f"{conn_result}\n\n{code_line}",
-                parse_mode="HTML"
-            )
-
-        Thread(target=run, daemon=True).start()
-
-    # ── Лог ──────────────────────────────────────────────────────────────────
-
-    def open_log(c: CallbackQuery):
-        entries = log_entries()
-        if not entries:
-            text = "📜 Лог выдач пуст."
-        else:
-            lines = []
-            for e in reversed(entries[-30:]):
-                lines.append(
-                    f"🕐 {e['time']} | 👤 {e['buyer']}\n"
-                    f"   📧 {e['email']} → <code>{e['code']}</code> | лот {e['lot_id']}"
-                )
-            text = "📜 <b>Последние выдачи (30):</b>\n\n" + "\n\n".join(lines)
-        bot.edit_message_text(text, c.message.chat.id, c.message.id,
-                              reply_markup=K().add(B("◀️ Назад", callback_data=AC_MAIN)),
-                              parse_mode="HTML")
-        bot.answer_callback_query(c.id)
-
-    # ── Статистика ──────────────────────────────────────────────────────────
-
-    def open_stats(c: CallbackQuery):
-        entries = log_entries()
-        if not entries:
-            bot.edit_message_text(
-                "📊 <b>Статистика выдач</b>\n\nЛог пуст.",
-                c.message.chat.id, c.message.id,
-                reply_markup=K().add(B("◀️ Назад", callback_data=AC_MAIN)), parse_mode="HTML"
-            )
-            bot.answer_callback_query(c.id)
-            return
-
-        from datetime import date as _date, timedelta as _td
-        today_str  = _date.today().strftime("%d.%m.%Y")
-        week_dates = {(_date.today() - _td(days=i)).strftime("%d.%m.%Y") for i in range(7)}
-
-        total      = len(entries)
-        today_cnt  = sum(1 for e in entries if e["time"].startswith(today_str))
-        week_cnt   = sum(1 for e in entries if e["time"][:10] in week_dates)
-
-        from collections import Counter
-        email_cnt   = Counter(e["email"]  for e in entries)
-        buyer_cnt   = Counter(e["buyer"]  for e in entries)
-        top_emails  = email_cnt.most_common(5)
-        top_buyers  = buyer_cnt.most_common(3)
-        email_lines = "\n".join(f"   • <code>{em}</code>: {cnt}\u00a0выдач" for em, cnt in top_emails)
-        buyer_lines = "\n".join(f"   • <b>{b}</b>: {cnt}" for b, cnt in top_buyers)
-
-        text = (
-            "📊 <b>Статистика выдач</b>\n\n"
-            f"📌 Всего в логе: <b>{total}</b>\n"
-            f"📅 Сегодня: <b>{today_cnt}</b>\n"
-            f"📆 За 7 дней: <b>{week_cnt}</b>\n\n"
-            f"📧 Топ почт (по выдачам):\n{email_lines or '   —'}\n\n"
-            f"👤 Топ покупателей:\n{buyer_lines or '   —'}"
-        )
-        bot.edit_message_text(
-            text, c.message.chat.id, c.message.id,
-            reply_markup=K().add(B("◀️ Назад", callback_data=AC_MAIN)), parse_mode="HTML"
-        )
-        bot.answer_callback_query(c.id)
-
-    # ── /autocode ─────────────────────────────────────────────────────────────
-
-    def cmd_autocode(m: Message):
-        active = len(get_active_rentals())
-        expiring = len(get_expiring_rentals(2))
-        bot.send_message(
-            m.chat.id,
-            f"⚙️ <b>AutoCode v3</b>\n\n"
-            f"🏠 Активных аренд: <b>{active}</b>\n"
-            f"⚠️ Истекают в 2ч: <b>{expiring}</b>",
-            reply_markup=kb_main(), parse_mode="HTML"
-        )
-
-    # ── Регистрация ──────────────────────────────────────────────────────────
-
-    tg.cbq_handler(open_plugin_settings, lambda c: c.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"))
-    tg.cbq_handler(open_main,     lambda c: c.data == AC_MAIN)
-    tg.cbq_handler(open_list,     lambda c: c.data.startswith(f"{AC_LIST}:"))
-    tg.cbq_handler(act_add,       lambda c: c.data == AC_ADD)
-    tg.cbq_handler(open_edit,     lambda c: c.data.startswith(f"{AC_EDIT}:") and len(c.data.split(":")) == 2)
-    tg.cbq_handler(ask_del,       lambda c: c.data.startswith(f"{AC_DEL_ASK}:"))
-    tg.cbq_handler(do_del,        lambda c: c.data.startswith(f"{AC_DEL_OK}:"))
-
-    tg.cbq_handler(act_age,       lambda c: c.data.startswith(f"{AC_MAX_AGE}:"))
-    tg.cbq_handler(act_len,       lambda c: c.data.startswith(f"{AC_LEN}:"))
-    tg.cbq_handler(open_type,     lambda c: c.data.startswith(f"{AC_TYPE}:"))
-    tg.cbq_handler(toggle_spaces, lambda c: c.data.startswith(f"{AC_SPACES}:"))
-    tg.cbq_handler(act_from,      lambda c: c.data.startswith(f"{AC_FROM}:"))
-    tg.cbq_handler(act_subj,      lambda c: c.data.startswith(f"{AC_SUBJ}:"))
-    tg.cbq_handler(act_body,      lambda c: c.data.startswith(f"{AC_BODY}:"))
-    tg.cbq_handler(do_test,       lambda c: c.data.startswith(f"{AC_TEST}:"))
-    tg.cbq_handler(open_log,      lambda c: c.data == AC_LOG)
-    tg.cbq_handler(open_rentals,  lambda c: c.data == AC_RENTALS)
-    tg.cbq_handler(do_rent_del,   lambda c: c.data.startswith(f"{AC_RENT_DEL}:") and not c.data.startswith(f"{AC_RENT_DEL_OK}:"))
-    tg.cbq_handler(do_rent_del_ok,lambda c: c.data.startswith(f"{AC_RENT_DEL_OK}:"))
-    tg.cbq_handler(do_rent_ext,   lambda c: c.data.startswith(f"{AC_RENT_EXT}:"))
-    tg.cbq_handler(open_stats,    lambda c: c.data == AC_STATS)
-
-    tg.msg_handler(got_email,  func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_EMAIL))
-    tg.msg_handler(got_pass,   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_PASS))
-    tg.msg_handler(got_imap,   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_IMAP))
-    tg.msg_handler(got_age,    func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_MAX_AGE))
-    tg.msg_handler(got_len,    func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_LEN))
-    tg.msg_handler(got_from,   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_FROM))
-    tg.msg_handler(got_subj,   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_SUBJ))
-    tg.msg_handler(got_body,   func=lambda m: tg.check_state(m.chat.id, m.from_user.id, ST_BODY))
-
-    tg.msg_handler(cmd_autocode, commands=["autocode"])
-
-    cardinal.add_telegram_commands(UUID, [
-        ("autocode", "AutoCode — управление IMAP выдачей кодов", True)
+    cutoff = now + within_hours * 3600
+    return [
+        r for r in rentals().values()
+        if now < r.get("expires_at", 0) <= cutoff
+    ]
+
+# ── Rate-limit helpers ───────────────────────────────────────────────────────
+_code_requests: dict[str, list[float]] = {}
+_last_code_ts:  dict[str, float]       = {}
+
+def _check_rate(buyer: str) -> tuple[bool, str]:
+    now = time.time()
+    last = _last_code_ts.get(buyer, 0)
+    if now - last < CODE_CD:
+        wait = int(CODE_CD - (now - last))
+        return False, f"⏳ Подождите {wait} сек. перед повторным запросом."
+    hour_ago = now - 3600
+    reqs = [t for t in _code_requests.get(buyer, []) if t > hour_ago]
+    _code_requests[buyer] = reqs
+    if len(reqs) >= MAX_CODES_HOUR:
+        return False, f"❌ Превышен лимит ({MAX_CODES_HOUR} запросов/час). Обратитесь к продавцу."
+    return True, ""
+
+def _record_request(buyer: str):
+    now = time.time()
+    _last_code_ts[buyer] = now
+    _code_requests.setdefault(buyer, []).append(now)
+
+# ── Keyboards ────────────────────────────────────────────────────────────────
+def kb_main():
+    return K(keyboard=[
+        [B("📬 Список почт",     callback_data=f"{AC_LIST}:0")],
+        [B("🏠 Активные аренды", callback_data=AC_RENTALS),
+         B("📜 Лог выдач",       callback_data=AC_LOG)],
+        [B("📊 Статистика",      callback_data=AC_STATS),
+         B("📢 Рассылка",        callback_data=AC_BROADCAST)],
     ])
 
-    # Запускаем фоновый поток проверки истекших аренд
-    Thread(target=_expiry_watcher, args=(cardinal,), daemon=True).start()
+def kb_stats_period():
+    return K(keyboard=[
+        [B("⏱ 24 часа",     callback_data=AC_STATS_24H),
+         B("⏱ 48 часов",    callback_data=AC_STATS_48H)],
+        [B("📅 7 дней",      callback_data=AC_STATS_7D),
+         B("📋 Всё время",   callback_data=AC_STATS_ALL)],
+        [B("🗓 Свой период", callback_data=AC_STATS_RANGE)],
+        [B("◀ Назад",        callback_data=AC_MAIN)],
+    ])
 
+def kb_broadcast_menu():
+    return K(keyboard=[
+        [B("✍️ Новое сообщение",  callback_data=AC_BCAST_SEND)],
+        [B("📁 Шаблоны",          callback_data=AC_BCAST_TPLS)],
+        [B("📋 История рассылок", callback_data=AC_BCAST_HIST)],
+        [B("⏰ Отложенная",       callback_data=AC_BCAST_SCHED)],
+        [B("◀ Назад",             callback_data=AC_MAIN)],
+    ])
 
-# ─── Фоновый поток: следит за истечением аренд ───────────────────────────────
+def kb_templates(tpls):
+    rows = []
+    for i, t in enumerate(tpls):
+        rows.append([
+            B(f"📄 {t['name']}", callback_data=f"{AC_BCAST_TPL_USE}:{i}"),
+            B("🗑",              callback_data=f"{AC_BCAST_TPL_DEL}:{i}"),
+        ])
+    rows.append([B("➕ Добавить шаблон", callback_data=AC_BCAST_TPL_ADD)])
+    rows.append([B("◀ Назад",           callback_data=AC_BROADCAST)])
+    return K(keyboard=rows)
 
-def _expiry_watcher(cardinal: Cardinal):
-    """
-    Каждую минуту проверяет аренды.
-    Если аренда истекла — пишет покупателю в чат FunPay и удаляет из базы.
-    """
-    notified_expiring = set()  # чтобы не спамить уведомлениями "скоро истекает"
+# ── Stats helpers ────────────────────────────────────────────────────────────
+def _filter_log_by_hours(hours):
+    entries = log_entries()
+    if hours is None:
+        return entries
+    cutoff = time.time() - hours * 3600
+    return [e for e in entries if e.get("time", 0) >= cutoff]
 
+def _filter_log_by_range(date_from, date_to):
+    entries = log_entries()
+    return [
+        e for e in entries
+        if date_from.timestamp() <= e.get("time", 0) <= date_to.timestamp()
+    ]
+
+def _stats_text(entries, label: str) -> str:
+    total    = len(entries)
+    by_email = Counter(e.get("email") for e in entries)
+    by_buyer = Counter(e.get("buyer") for e in entries)
+
+    hours_list = [
+        datetime.fromtimestamp(e["time"]).hour
+        for e in entries if "time" in e
+    ]
+    peak = Counter(hours_list).most_common(3)
+    peak_str = ", ".join(f"{h:02d}:00 ({c})" for h, c in peak) or "—"
+
+    all_rents    = _load(RENTALS_FILE, {})
+    rent_by_buyer = Counter(r.get("buyer") for r in all_rents.values())
+    top_renters  = "\n".join(
+        f"  {i+1}. {b}: {c} аренд"
+        for i, (b, c) in enumerate(rent_by_buyer.most_common(3))
+    ) or "  —"
+
+    top_emails = "\n".join(
+        f"  {i+1}. {em}: {cnt}"
+        for i, (em, cnt) in enumerate(by_email.most_common(5))
+    ) or "  —"
+    top_buyers = "\n".join(
+        f"  {i+1}. {b}: {cnt}"
+        for i, (b, cnt) in enumerate(by_buyer.most_common(3))
+    ) or "  —"
+
+    active = len(get_active_rentals())
+
+    return (
+        f"📊 Статистика — {label}\n\n"
+        f"Выдано кодов: {total}\n"
+        f"Активных аренд сейчас: {active}\n\n"
+        f"⏰ Пиковые часы:\n  {peak_str}\n\n"
+        f"Топ аккаунтов:\n{top_emails}\n\n"
+        f"Топ покупателей (коды):\n{top_buyers}\n\n"
+        f"Топ покупателей (аренды):\n{top_renters}"
+    )
+
+# ── TG notifications ─────────────────────────────────────────────────────────
+def _notify_tg(cardinal, text: str):
+    try:
+        bot = cardinal.telegram.bot
+        for uid in cardinal.telegram.authorized_users:
+            bot.send_message(uid, text)
+    except Exception as e:
+        logger.warning(f"TG notify failed: {e}")
+
+def _notify_tg_code_not_found(cardinal, buyer, email_addr, reason):
+    _notify_tg(cardinal,
+        f"⚠️ Код не найден\nПокупатель: {buyer}\nПочта: {email_addr}\nПричина: {reason}")
+
+def _notify_tg_rate_limit(cardinal, buyer, count):
+    _notify_tg(cardinal,
+        f"🚨 Лимит запросов\nПокупатель {buyer} сделал {count} запросов за час.")
+
+# ── Expiry watcher ───────────────────────────────────────────────────────────
+def _expiry_watcher(cardinal):
+    warned_4h  = set()
+    warned_30m = set()
     while True:
+        time.sleep(60)
         try:
-            time.sleep(60)
-            now = time.time()
-            rents = rentals()
+            rents   = rentals()
+            now     = time.time()
             changed = False
+            for key, r in list(rents.items()):
+                exp       = r.get("expires_at", 0)
+                cid       = r.get("chat_id")
+                cname     = r.get("chat_name", "")
 
-            for order_key, r in list(rents.items()):
-                expires_at = r.get("expires_at", 0)
-                chat_id    = r.get("chat_id")
-                chat_name  = r.get("buyer")
-                buyer_name = r.get("buyer", order_key)
+                # 4-часовое предупреждение
+                if key not in warned_4h and 0 < exp - now <= WARN_BEFORE_H * 3600:
+                    warned_4h.add(key)
+                    Thread(
+                        target=cardinal.send_message,
+                        args=(cid,
+                              f"⏰ До окончания аренды осталось {WARN_BEFORE_H} часа. "
+                              f"Хотите продлить? Просто сделайте новый заказ 😊",
+                              cname),
+                        daemon=True,
+                    ).start()
 
-                # Уведомление за 30 минут до истечения (один раз)
-                warn_key = f"{order_key}_warn"
-                if (expires_at - now) <= 1800 and warn_key not in notified_expiring:
-                    notified_expiring.add(warn_key)
-                    if chat_id:
-                        remaining = _fmt_remaining(expires_at)
-                        Thread(
-                            target=cardinal.send_message,
-                            args=(chat_id,
-                                  f"⚠️ Ваша аренда истекает через ~{remaining}.\n"
-                                  f"Хотите продлить? Напишите нам!",
-                                  chat_name),
-                            daemon=True
-                        ).start()
+                # 30-минутное предупреждение
+                if key not in warned_30m and 0 < exp - now <= 1800:
+                    warned_30m.add(key)
+                    Thread(
+                        target=cardinal.send_message,
+                        args=(cid, "⏰ До окончания аренды осталось 30 минут!", cname),
+                        daemon=True,
+                    ).start()
 
-                # Аренда истекла
-                if now >= expires_at:
-                    if chat_id:
-                        Thread(
-                            target=cardinal.send_message,
-                            args=(chat_id,
-                                  f"✅ Ваша аренда завершена, спасибо за покупку!\n\n"
-                                  f"Хотите продлить? Просто сделайте новый заказ 😊",
-                                  chat_name),
-                            daemon=True
-                        ).start()
-                    del rents[order_key]
-                    notified_expiring.discard(warn_key)
+                # Истекла
+                if now > exp:
+                    Thread(
+                        target=cardinal.send_message,
+                        args=(cid,
+                              "✅ Ваша аренда завершена, спасибо за покупку! "
+                              "Хотите продлить? Просто сделайте новый заказ 😊",
+                              cname),
+                        daemon=True,
+                    ).start()
+                    del rents[key]
+                    warned_4h.discard(key)
+                    warned_30m.discard(key)
                     changed = True
-                    logger.info(f"[AutoCode] Аренда {order_key} ({buyer_name}) истекла и закрыта.")
 
             if changed:
                 save_rentals(rents)
+        except Exception as e:
+            logger.error(f"Expiry watcher error: {e}")
 
-        except Exception as ex:
-            logger.error(f"[AutoCode] Ошибка в фоновом потоке: {ex}")
+# ── Parse hours from lot name ────────────────────────────────────────────────
+def _parse_hours(text: str) -> int | None:
+    m = re.search(r"(\d+)\s*ч", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*д(ень|ня|ней)?", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1)) * 24
+    return None
 
+# ── on_new_order ─────────────────────────────────────────────────────────────
+def on_new_order(c, e: NewOrderEvent):
+    global _cardinal_ref
+    _cardinal_ref = c
 
-# ─── Обработчик нового заказа (триггер) ──────────────────────────────────────
-
-def on_new_order(c: Cardinal, e: NewOrderEvent):
-    """
-    Срабатывает когда FunPay фиксирует новый заказ.
-    Парсим название лота → часы аренды → ищем почту в тексте автовыдачи.
-    """
-    order = e.order
-    description = order.description or ""
-    buyer       = order.buyer_username or ""
-    chat_id     = order.chat_id
-    lot_id      = str(getattr(order, "lot_id", "") or "")
-    purchase_ts = order.date.timestamp() if order.date else time.time()
-
-    # Ищем часы аренды в названии лота
-    hours = parse_hours_from_lot(description)
+    desc     = getattr(e.order, "description", "") or ""
+    lot_name = getattr(e.order, "lot_name", "") or desc
+    hours    = _parse_hours(lot_name)
     if not hours:
-        # Лот без указания часов — пропускаем
         return
 
-    # Ищем почту из настроенных аккаунтов которая привязана к этому лоту
-    accs = accounts()
-    matched_email = None
-    matched_acc   = None
+    buyer     = getattr(e.order, "buyer_username", "") or ""
+    chat_id   = getattr(e.order, "chat_id", None)
+    chat_name = getattr(e.order, "chat_name", "") or buyer
+    order_id  = str(getattr(e.order, "id", uuid_lib.uuid4()))
+    lot_id    = str(getattr(e.order, "lot_id", ""))
+
+    accs      = accounts()
+    acc_email = None
     for acc in accs:
-        if not acc.get("lot_ids") or lot_id in acc.get("lot_ids", []):
-            matched_email = acc["email"]
-            matched_acc   = acc
+        if lot_id in acc.get("lot_ids", []) or not acc.get("lot_ids"):
+            acc_email = acc["email"]
             break
-
-    if not matched_email:
-        logger.info(f"[AutoCode] Заказ {order.id}: подходящей почты нет.")
+    if not acc_email:
+        logger.warning(f"AutoCode: нет аккаунта для лота {lot_id}")
         return
 
-    expires_at = purchase_ts + hours * 3600
-
-    # Сохраняем аренду по order_id — один покупатель может иметь несколько активных аренд
+    now   = time.time()
     rents = rentals()
-    order_key = str(order.id) if order.id else f"{buyer}_{int(purchase_ts)}"
-    rents[order_key] = {
-        "order_key":   order_key,
+
+    # Авто-продление: если у покупателя уже есть активная аренда — продлеваем
+    for k, r in rents.items():
+        if r.get("buyer") == buyer and r.get("expires_at", 0) > now:
+            rents[k]["expires_at"] += hours * 3600
+            rents[k]["hours"]      += hours
+            save_rentals(rents)
+            Thread(
+                target=c.send_message,
+                args=(chat_id,
+                      f"✅ Аренда продлена на {hours}ч!\n"
+                      f"Новое время окончания: {_fmt_time(rents[k]['expires_at'])}",
+                      chat_name),
+                daemon=True,
+            ).start()
+            logger.info(f"AutoCode: продление {buyer} +{hours}ч")
+            return
+
+    expires_at = now + hours * 3600
+    rents[order_id] = {
+        "order_key":   order_id,
         "buyer":       buyer,
         "chat_id":     chat_id,
-        "email":       matched_email,
+        "chat_name":   chat_name,
+        "email":       acc_email,
         "lot_id":      lot_id,
-        "order_id":    order.id,
-        "purchase_ts": purchase_ts,
+        "order_id":    order_id,
+        "purchase_ts": now,
         "expires_at":  expires_at,
         "hours":       hours,
     }
     save_rentals(rents)
+    logger.info(f"AutoCode: новая аренда {buyer} | {acc_email} | {hours}ч | до {_fmt_time(expires_at)}")
 
-    logger.info(
-        f"[AutoCode] Новая аренда: {buyer} | {matched_email} | {hours}ч "
-        f"| истекает {_fmt_time(expires_at)}"
-    )
+# ── on_new_message ────────────────────────────────────────────────────────────
+def on_new_message(c, e: NewMessageEvent):
+    global _cardinal_ref
+    _cardinal_ref = c
 
-
-# ─── Обработчик команды !cd в чате FunPay ────────────────────────────────────
-
-def on_new_message(c: Cardinal, e: NewMessageEvent):
     if e.message.author_id == c.account.id:
         return
 
-    # Обрабатываем только команду !cd
-    if (e.message.text or "").strip().lower() != "!cd":
+    text = (e.message.text or "").strip()
+    if text.lower() not in ("!cd", "code"):
         return
 
+    buyer     = e.message.author
     chat_id   = e.message.chat_id
     chat_name = e.message.chat_name
-    buyer     = e.message.author
 
-    def process():
-        # Проверяем есть ли активные аренды у покупателя (ищем по buyer в значениях)
-        rents = rentals()
-        now = time.time()
-        # Все активные аренды этого покупателя, отсортированые по времени покупки (новейшие впереди)
-        buyer_rentals = sorted(
-            [r for r in rents.values() if r["buyer"] == buyer and r["expires_at"] > now],
-            key=lambda r: r["purchase_ts"],
-            reverse=True
-        )
+    # Rate limit / cooldown
+    allowed, reason = _check_rate(buyer)
+    if not allowed:
+        Thread(target=c.send_message, args=(chat_id, reason, chat_name), daemon=True).start()
+        reqs = _code_requests.get(buyer, [])
+        if len(reqs) >= MAX_CODES_HOUR:
+            Thread(target=_notify_tg_rate_limit, args=(c, buyer, len(reqs)), daemon=True).start()
+        return
 
-        if not buyer_rentals:
-            c.send_message(chat_id,
-                           "❌ У вас нет активной аренды. Пожалуйста, оформите заказ.",
-                           chat_name)
-            return
+    # Проверяем активную аренду
+    now   = time.time()
+    rents = rentals()
+    active = sorted(
+        [r for r in rents.values() if r.get("buyer") == buyer and r.get("expires_at", 0) > now],
+        key=lambda r: r.get("purchase_ts", 0),
+        reverse=True,
+    )
+    if not active:
+        Thread(
+            target=c.send_message,
+            args=(chat_id, "❌ У вас нет активной аренды. Пожалуйста, оформите заказ.", chat_name),
+            daemon=True,
+        ).start()
+        return
 
-        # Берём самую позднюю активную аренду
-        rental = buyer_rentals[0]
+    rental    = active[0]
+    acc_email = rental.get("email")
+    accs      = accounts()
+    acc       = next((a for a in accs if a["email"] == acc_email), None)
+    if not acc:
+        Thread(
+            target=c.send_message,
+            args=(chat_id, "⚠️ Почтовый аккаунт не настроен. Обратитесь к продавцу.", chat_name),
+            daemon=True,
+        ).start()
+        return
 
-        # Находим настройки почты
+    _record_request(buyer)
+
+    used     = used_codes()
+    code_val, err = fetch_code(acc, used, not_before_ts=rental.get("purchase_ts", 0))
+
+    if not code_val:
+        reason = err or "Код не найден."
+        Thread(target=_notify_tg_code_not_found, args=(c, buyer, acc_email, reason), daemon=True).start()
+        Thread(
+            target=c.send_message,
+            args=(chat_id, "❌ Код не найден. Попробуйте через минуту или обратитесь к продавцу.", chat_name),
+            daemon=True,
+        ).start()
+        return
+
+    used.setdefault(acc_email, []).append(code_val)
+    save_used(used)
+    add_log(acc_email, rental.get("lot_id", "—"), buyer, code_val)
+
+    received_dt = datetime.now().strftime("%d.%m.%Y %H:%M")
+    msg = f"🔑 Ваш код: {code_val}\n📅 Получен: {received_dt}"
+    Thread(target=c.send_message, args=(chat_id, msg, chat_name), daemon=True).start()
+
+# ── Telegram UI ──────────────────────────────────────────────────────────────
+def init_autocode_tg(cardinal, *args):
+    global _cardinal_ref
+    _cardinal_ref = cardinal
+    bot = cardinal.telegram.bot
+
+    _bcast = {"text": "", "failed": [], "scheduled_timer": None}
+
+    # /autocode command
+    @bot.message_handler(commands=["autocode"])
+    def cmd_autocode(message: Message):
+        bot.send_message(message.chat.id, "⚙️ AutoCode v5", reply_markup=kb_main())
+
+    # Main menu
+    @bot.callback_query_handler(func=lambda c: c.data == AC_MAIN)
+    def open_main(call: CallbackQuery):
+        bot.edit_message_text("⚙️ AutoCode v5", call.message.chat.id,
+                              call.message.message_id, reply_markup=kb_main())
+
+    # ── Account list ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LIST}:"))
+    def open_list(call: CallbackQuery):
         accs = accounts()
-        acc = next((a for a in accs if a["email"] == rental["email"]), None)
-        if not acc:
-            # Почта была удалена — берём первую подходящую
-            lot_id = rental.get("lot_id", "")
-            acc = next(
-                (a for a in accs if not a.get("lot_ids") or lot_id in a.get("lot_ids", [])),
-                None
-            )
-        if not acc:
-            c.send_message(chat_id, "❌ Почта не настроена. Обратитесь к продавцу.", chat_name)
+        rows = []
+        for i, a in enumerate(accs):
+            rows.append([B(f"📧 {a['email']}", callback_data=f"{AC_EDIT}:{i}")])
+        rows.append([B("➕ Добавить почту", callback_data=AC_ADD)])
+        rows.append([B("◀ Назад", callback_data=AC_MAIN)])
+        bot.edit_message_text("📬 Почтовые аккаунты:", call.message.chat.id,
+                              call.message.message_id, reply_markup=K(keyboard=rows))
+
+    # ── Add account ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_ADD)
+    def act_add(call: CallbackQuery):
+        msg = bot.send_message(call.message.chat.id, "Введите email:")
+        bot.register_next_step_handler(msg, _step_email)
+
+    def _step_email(message: Message):
+        email_addr = message.text.strip()
+        auto_host  = detect_imap_host(email_addr)
+        accs = accounts()
+        accs.append({
+            "email": email_addr, "password": "", "imap_host": auto_host,
+            "lot_ids": [], "code_type": "alnum", "code_len": 0,
+            "allow_spaces": False, "max_age_min": 60,
+            "filter_from": "", "filter_subj": "", "filter_body": "",
+        })
+        save_accs(accs)
+        idx = len(accs) - 1
+        msg = bot.send_message(message.chat.id,
+            f"✅ Добавлен. IMAP определён автоматически: {auto_host}\nВведите пароль:")
+        bot.register_next_step_handler(msg, lambda m: _step_pass(m, idx))
+
+    def _step_pass(message: Message, idx: int):
+        accs = accounts()
+        accs[idx]["password"] = message.text.strip()
+        save_accs(accs)
+        bot.send_message(message.chat.id,
+            f"✅ Пароль сохранён.\nIMAP: {accs[idx]['imap_host']}\n"
+            f"Используйте /autocode → редактировать для дополнительных настроек.")
+
+    # ── Edit account ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_EDIT}:"))
+    def open_edit(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        accs = accounts()
+        if idx >= len(accs):
             return
-
-        purchase_ts = rental.get("purchase_ts")
-        remaining   = _fmt_remaining(rental["expires_at"])
-
-        c.send_message(chat_id, f"⏳ Ищу код...", chat_name)
-
-        used = used_codes()
-
-        # Ищем код ТОЛЬКО в письмах после момента покупки
-        code, err = fetch_code(acc, used, not_before_ts=purchase_ts)
-
-        if err:
-            logger.warning(f"[AutoCode] {err}")
-            # Уведомление в Telegram что код не найден
-            _notify_tg_code_not_found(c, buyer, rental["email"], err)
-            c.send_message(chat_id,
-                           "❌ Не удалось получить код. Продавец уже уведомлён и поможет вам вручную.",
-                           chat_name)
-            return
-
-        if not code:
-            # Уведомление в Telegram
-            _notify_tg_code_not_found(c, buyer, rental["email"], "Письмо не найдено")
-            c.send_message(chat_id,
-                           "❌ Код не найден. Попробуйте через минуту или обратитесь к продавцу.",
-                           chat_name)
-            return
-
-        # Антидубль
-        key = f"{acc['email']}:{code}"
-        used[key] = {
-            "buyer":  buyer,
-            "lot_id": rental.get("lot_id", "—"),
-            "time":   datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-        }
-        save_used(used)
-
-        # Лог
-        add_log(acc["email"], rental.get("lot_id", "—"), buyer, code)
-
-        c.send_message(
-            chat_id,
-            f"📧 {acc['email']}: {code}\n⏳ Аренда активна ещё: {remaining}",
-            chat_name
-        )
-
-    Thread(target=process, daemon=True).start()
-
-
-def _notify_tg_code_not_found(cardinal: Cardinal, buyer: str, email_addr: str, reason: str):
-    """Отправляет уведомление в Telegram когда код не найден."""
-    try:
+        acc = accs[idx]
         text = (
-            f"⚠️ <b>AutoCode: код не найден!</b>\n\n"
-            f"👤 Покупатель: <b>{buyer}</b>\n"
-            f"📧 Почта: <code>{email_addr}</code>\n"
-            f"❗ Причина: {reason}\n\n"
-            f"Требуется ручная помощь!"
+            f"📧 {acc['email']}\n"
+            f"🔌 IMAP: {acc.get('imap_host', detect_imap_host(acc['email']))}\n"
+            f"📦 Лоты: {', '.join(acc.get('lot_ids', [])) or 'все'}\n"
+            f"🔤 Тип: {acc.get('code_type', 'alnum')} | "
+            f"Длина: {acc.get('code_len', 0) or 'авто'}\n"
+            f"📬 От: {acc.get('filter_from') or '—'} | "
+            f"Тема: {acc.get('filter_subj') or '—'}"
         )
-        cardinal.telegram.send_notification(text, notification_type="autocode_error")
-    except Exception as ex:
-        logger.warning(f"[AutoCode] Не удалось отправить уведомление: {ex}")
+        kb = K(keyboard=[
+            [B("🔌 IMAP хост",  callback_data=f"{AC_IMAP}:{idx}"),
+             B("📦 Лоты",       callback_data=f"{AC_LOTS}:{idx}")],
+            [B("🔢 Длина кода", callback_data=f"{AC_LEN}:{idx}"),
+             B("🔤 Тип кода",   callback_data=f"{AC_TYPE}:{idx}")],
+            [B("📬 От (from)",  callback_data=f"{AC_FROM}:{idx}"),
+             B("📌 Тема",       callback_data=f"{AC_SUBJ}:{idx}")],
+            [B("🔍 Тест IMAP",  callback_data=f"{AC_TEST}:{idx}"),
+             B("🗑 Удалить",    callback_data=f"{AC_DEL_ASK}:{idx}")],
+            [B("◀ Назад",       callback_data=f"{AC_LIST}:0")],
+        ])
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_IMAP}:"))
+    def act_imap(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        auto = detect_imap_host(accs[idx]["email"])
+        msg  = bot.send_message(call.message.chat.id,
+            f"Текущий IMAP: {accs[idx].get('imap_host', auto)}\n"
+            f"Авто: {auto}\nВведите новый хост или «авто»:")
+        bot.register_next_step_handler(msg, lambda m: _save_imap(m, idx))
+
+    def _save_imap(message: Message, idx: int):
+        accs = accounts()
+        val  = message.text.strip()
+        accs[idx]["imap_host"] = (
+            detect_imap_host(accs[idx]["email"]) if val.lower() == "авто" else val
+        )
+        save_accs(accs)
+        bot.send_message(message.chat.id, f"✅ IMAP: {accs[idx]['imap_host']}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_TEST}:"))
+    def do_test(call: CallbackQuery):
+        idx    = int(call.data.split(":")[1])
+        accs   = accounts()
+        result = test_imap(accs[idx])
+        bot.answer_callback_query(call.id, result, show_alert=True)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_DEL_ASK}:"))
+    def ask_del(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        kb  = K(keyboard=[
+            [B("✅ Да, удалить", callback_data=f"{AC_DEL_OK}:{idx}"),
+             B("❌ Отмена",      callback_data=f"{AC_LIST}:0")],
+        ])
+        bot.edit_message_text("Удалить аккаунт?", call.message.chat.id,
+                              call.message.message_id, reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_DEL_OK}:"))
+    def do_del(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        if idx < len(accs):
+            accs.pop(idx)
+            save_accs(accs)
+        bot.edit_message_text("🗑 Удалён.", call.message.chat.id,
+                              call.message.message_id, reply_markup=kb_main())
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LEN}:"))
+    def act_len(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id, "Введите длину кода (0 = авто):")
+        bot.register_next_step_handler(msg, lambda m: _save_int(m, idx, "code_len"))
+
+    def _save_int(message: Message, idx: int, field: str):
+        try:
+            val = int(message.text.strip())
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ Введите число.")
+            return
+        accs = accounts()
+        accs[idx][field] = val
+        save_accs(accs)
+        bot.send_message(message.chat.id, f"✅ {field} = {val}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_FROM}:"))
+    def act_from(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id, "Фильтр «От» (email отправителя, или пусто):")
+        bot.register_next_step_handler(msg, lambda m: _save_str(m, idx, "filter_from"))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_SUBJ}:"))
+    def act_subj(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id, "Фильтр по теме письма (или пусто):")
+        bot.register_next_step_handler(msg, lambda m: _save_str(m, idx, "filter_subj"))
+
+    def _save_str(message: Message, idx: int, field: str):
+        accs = accounts()
+        accs[idx][field] = message.text.strip()
+        save_accs(accs)
+        bot.send_message(message.chat.id, f"✅ {field} сохранён.")
+
+    # ── Lots ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOTS}:"))
+    def open_lots(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        acc  = accs[idx]
+        lots = acc.get("lot_ids", [])
+        rows = [[B(f"🗑 {l}", callback_data=f"{AC_LOT_DEL}:{idx}:{l}")] for l in lots]
+        rows.append([B("➕ Добавить лот", callback_data=f"{AC_LOT_ADD}:{idx}")])
+        rows.append([B("◀ Назад",        callback_data=f"{AC_EDIT}:{idx}")])
+        bot.edit_message_text(f"Лоты для {acc['email']}:", call.message.chat.id,
+                              call.message.message_id, reply_markup=K(keyboard=rows))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOT_ADD}:"))
+    def act_lot_add(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id, "Введите ID лота:")
+        bot.register_next_step_handler(msg, lambda m: _do_lot_add(m, idx))
+
+    def _do_lot_add(message: Message, idx: int):
+        accs = accounts()
+        accs[idx].setdefault("lot_ids", []).append(message.text.strip())
+        save_accs(accs)
+        bot.send_message(message.chat.id, "✅ Лот добавлен.")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOT_DEL}:"))
+    def act_lot_del(call: CallbackQuery):
+        parts = call.data.split(":")
+        idx, lot = int(parts[1]), parts[2]
+        accs = accounts()
+        accs[idx]["lot_ids"] = [l for l in accs[idx].get("lot_ids", []) if l != lot]
+        save_accs(accs)
+        bot.answer_callback_query(call.id, f"Лот {lot} удалён.")
+
+    # ── Log ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_LOG)
+    def open_log(call: CallbackQuery):
+        entries = log_entries()[-30:]
+        if not entries:
+            text = "Лог пуст."
+        else:
+            lines = [
+                f"{_fmt_time(e['time'])} | {e['buyer']} | {e['code']}"
+                for e in reversed(entries)
+            ]
+            text = "📜 Последние выдачи:\n\n" + "\n".join(lines)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+            reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]]))
+
+    # ── Rentals ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_RENTALS)
+    def open_rentals(call: CallbackQuery):
+        active = get_active_rentals()
+        if not active:
+            text = "Нет активных аренд."
+            kb   = K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]])
+        else:
+            lines = [
+                f"👤 {r['buyer']} | до {_fmt_time(r['expires_at'])} | {r['email']}"
+                for r in active
+            ]
+            rows = []
+            for r in active:
+                rows.append([
+                    B(f"🗑 {r['buyer']}", callback_data=f"{AC_RENT_DEL}:{r['order_key']}"),
+                    B("➕1ч",            callback_data=f"{AC_RENT_EXT}:{r['order_key']}:1"),
+                    B("➕24ч",           callback_data=f"{AC_RENT_EXT}:{r['order_key']}:24"),
+                ])
+            rows.append([B("◀ Назад", callback_data=AC_MAIN)])
+            text = "🏠 Активные аренды:\n\n" + "\n".join(lines)
+            kb   = K(keyboard=rows)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_DEL}:"))
+    def do_rent_del(call: CallbackQuery):
+        key   = call.data.split(":")[1]
+        rents = rentals()
+        rents.pop(key, None)
+        save_rentals(rents)
+        bot.answer_callback_query(call.id, "Аренда удалена.")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_EXT}:"))
+    def do_rent_ext(call: CallbackQuery):
+        parts = call.data.split(":")
+        key, hours = parts[1], int(parts[2])
+        rents = rentals()
+        if key in rents:
+            rents[key]["expires_at"] += hours * 3600
+            save_rentals(rents)
+        bot.answer_callback_query(call.id, f"Продлено на {hours}ч.")
+
+    # ── Stats ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_STATS)
+    def open_stats(call: CallbackQuery):
+        bot.edit_message_text("📊 Выберите период:", call.message.chat.id,
+                              call.message.message_id, reply_markup=kb_stats_period())
+
+    @bot.callback_query_handler(func=lambda c: c.data in (
+        AC_STATS_24H, AC_STATS_48H, AC_STATS_7D, AC_STATS_ALL
+    ))
+    def open_stats_period(call: CallbackQuery):
+        mapping = {
+            AC_STATS_24H: (24,   "24 часа"),
+            AC_STATS_48H: (48,   "48 часов"),
+            AC_STATS_7D:  (168,  "7 дней"),
+            AC_STATS_ALL: (None, "Всё время"),
+        }
+        hours, label = mapping[call.data]
+        entries = _filter_log_by_hours(hours)
+        bot.edit_message_text(
+            _stats_text(entries, label), call.message.chat.id, call.message.message_id,
+            reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_STATS)]]),
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data == AC_STATS_RANGE)
+    def ask_stats_range(call: CallbackQuery):
+        msg = bot.send_message(call.message.chat.id,
+            "Введите период:\n<code>01.05.2026-31.05.2026</code>", parse_mode="HTML")
+        bot.register_next_step_handler(msg, _handle_stats_range)
+
+    def _handle_stats_range(message: Message):
+        try:
+            a, b = message.text.strip().split("-", 1)
+            df = datetime.strptime(a.strip(), "%d.%m.%Y")
+            dt = datetime.strptime(b.strip(), "%d.%m.%Y").replace(hour=23, minute=59, second=59)
+            entries = _filter_log_by_range(df, dt)
+            label   = f"{df.strftime('%d.%m.%Y')} — {dt.strftime('%d.%m.%Y')}"
+            bot.send_message(message.chat.id, _stats_text(entries, label),
+                reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_STATS)]]))
+        except Exception:
+            bot.send_message(message.chat.id,
+                "❌ Неверный формат. Пример: <code>01.05.2026-31.05.2026</code>",
+                parse_mode="HTML")
+
+    # ── Broadcast ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_BROADCAST)
+    def open_broadcast(call: CallbackQuery):
+        active = get_active_rentals()
+        text   = f"📢 Рассылка\nАктивных аренд: <b>{len(active)}</b>"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              reply_markup=kb_broadcast_menu(), parse_mode="HTML")
+
+    @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_SEND)
+    def bcast_new(call: CallbackQuery):
+        msg = bot.send_message(call.message.chat.id, "Введите текст рассылки:")
+        bot.register_next_step_handler(msg, _handle_bcast_text)
+
+    def _handle_bcast_text(message: Message):
+        _bcast["text"] = message.text.strip()
+        active = get_active_rentals()
+        kb = K(keyboard=[
+            [B(f"✅ Отправить ({len(active)} чатов)", callback_data="ac_bcast_confirm")],
+            [B("💾 Сохранить как шаблон", callback_data=AC_BCAST_TPL_ADD)],
+            [B("❌ Отмена", callback_data=AC_BROADCAST)],
+        ])
+        bot.send_message(message.chat.id,
+            f"Предпросмотр:\n\n{_bcast['text']}", reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "ac_bcast_confirm")
+    def bcast_confirm(call: CallbackQuery):
+        _do_broadcast(call, get_active_rentals())
+
+    @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_RETRY)
+    def bcast_retry(call: CallbackQuery):
+        _do_broadcast(call, _bcast.get("failed", []), is_retry=True)
+
+    def _do_broadcast(call, targets, is_retry=False):
+        text = _bcast.get("text", "")
+        if not text:
+            bot.answer_callback_query(call.id, "Текст не задан.")
+            return
+        if not targets:
+            bot.answer_callback_query(call.id, "Нет получателей.")
+            return
+        bot.answer_callback_query(call.id, "Рассылка запущена...")
+
+        pairs = targets if is_retry else [
+            (r["chat_id"], r.get("chat_name", "")) for r in targets
+        ]
+
+        def _send_all():
+            ok, fail = 0, []
+            for chat_id, chat_name in pairs:
+                try:
+                    cardinal.send_message(chat_id, text, chat_name)
+                    ok += 1
+                except Exception as ex:
+                    logger.warning(f"Broadcast fail {chat_id}: {ex}")
+                    fail.append((chat_id, chat_name))
+                time.sleep(2)
+
+            _bcast["failed"] = fail
+
+            hist = bcast_history()
+            hist.append({
+                "time":   time.time(),
+                "text":   text,
+                "sent":   ok,
+                "failed": len(fail),
+            })
+            save_bcast_history(hist[-50:])
+
+            kb_rows = []
+            if fail:
+                kb_rows.append([B(f"🔄 Повторить ({len(fail)})", callback_data=AC_BCAST_RETRY)])
+            kb_rows.append([B("◀ Меню рассылки", callback_data=AC_BROADCAST)])
+            bot.send_message(call.message.chat.id,
+                f"📢 Рассылка завершена\n\n✅ Отправлено: {ok}\n❌ Не доставлено: {len(fail)}",
+                reply_markup=K(keyboard=kb_rows))
+
+        Thread(target=_send_all, daemon=True).start()
+
+    # ── Templates ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_TPLS)
+    def open_templates(call: CallbackQuery):
+        tpls = templates()
+        if not tpls:
+            bot.edit_message_text("Шаблонов нет.", call.message.chat.id,
+                call.message.message_id,
+                reply_markup=K(keyboard=[
+                    [B("➕ Добавить", callback_data=AC_BCAST_TPL_ADD)],
+                    [B("◀ Назад",    callback_data=AC_BROADCAST)],
+                ]))
+            return
+        bot.edit_message_text("📁 Шаблоны:", call.message.chat.id,
+                              call.message.message_id, reply_markup=kb_templates(tpls))
+
+    @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_TPL_ADD)
+    def add_template(call: CallbackQuery):
+        msg = bot.send_message(call.message.chat.id, "Введите название шаблона:")
+        bot.register_next_step_handler(msg, _step_tpl_name)
+
+    def _step_tpl_name(message: Message):
+        name = message.text.strip()
+        msg  = bot.send_message(message.chat.id, "Введите текст шаблона:")
+        bot.register_next_step_handler(msg, lambda m: _step_tpl_text(m, name))
+
+    def _step_tpl_text(message: Message, name: str):
+        tpls = templates()
+        tpls.append({"name": name, "text": message.text.strip()})
+        save_templates(tpls)
+        bot.send_message(message.chat.id, f"✅ Шаблон «{name}» сохранён.")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_BCAST_TPL_USE}:"))
+    def use_template(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        tpls = templates()
+        if idx >= len(tpls):
+            return
+        _bcast["text"] = tpls[idx]["text"]
+        active = get_active_rentals()
+        kb = K(keyboard=[
+            [B(f"✅ Отправить ({len(active)} чатов)", callback_data="ac_bcast_confirm")],
+            [B("❌ Отмена", callback_data=AC_BROADCAST)],
+        ])
+        bot.send_message(call.message.chat.id,
+            f"Предпросмотр:\n\n{_bcast['text']}", reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_BCAST_TPL_DEL}:"))
+    def del_template(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        tpls = templates()
+        if idx < len(tpls):
+            tpls.pop(idx)
+            save_templates(tpls)
+        bot.answer_callback_query(call.id, "Шаблон удалён.")
+
+    # ── Broadcast history ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_HIST)
+    def open_bcast_hist(call: CallbackQuery):
+        hist = bcast_history()[-20:]
+        if not hist:
+            text = "История рассылок пуста."
+        else:
+            lines = [
+                f"{_fmt_time(h['time'])} | ✅{h['sent']} ❌{h['failed']}\n"
+                f"  {h['text'][:60]}{'...' if len(h['text']) > 60 else ''}"
+                for h in reversed(hist)
+            ]
+            text = "📋 История рассылок:\n\n" + "\n\n".join(lines)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+            reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_BROADCAST)]]))
+
+    # ── Scheduled broadcast ──
+    @bot.callback_query_handler(func=lambda c: c.data == AC_BCAST_SCHED)
+    def open_sched(call: CallbackQuery):
+        msg = bot.send_message(call.message.chat.id, "Введите текст рассылки:")
+        bot.register_next_step_handler(msg, _sched_step_text)
+
+    def _sched_step_text(message: Message):
+        _bcast["text"] = message.text.strip()
+        msg = bot.send_message(message.chat.id,
+            "Введите время отправки:\n<code>31.05.2026 18:00</code>", parse_mode="HTML")
+        bot.register_next_step_handler(msg, _sched_step_time)
+
+    def _sched_step_time(message: Message):
+        try:
+            dt    = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M")
+            delay = (dt - datetime.now()).total_seconds()
+            if delay <= 0:
+                bot.send_message(message.chat.id, "❌ Время уже прошло.")
+                return
+
+            if _bcast.get("scheduled_timer"):
+                _bcast["scheduled_timer"].cancel()
+
+            def _fire():
+                targets = get_active_rentals()
+                ok, fail = 0, []
+                for r in targets:
+                    try:
+                        cardinal.send_message(r["chat_id"], _bcast["text"], r.get("chat_name", ""))
+                        ok += 1
+                    except Exception:
+                        fail.append((r["chat_id"], r.get("chat_name", "")))
+                    time.sleep(2)
+                hist = bcast_history()
+                hist.append({"time": time.time(), "text": _bcast["text"],
+                             "sent": ok, "failed": len(fail)})
+                save_bcast_history(hist[-50:])
+                try:
+                    for uid in cardinal.telegram.authorized_users:
+                        bot.send_message(uid,
+                            f"📢 Отложенная рассылка выполнена\n✅ {ok} | ❌ {len(fail)}")
+                except Exception:
+                    pass
+
+            t = Timer(delay, _fire)
+            t.daemon = True
+            t.start()
+            _bcast["scheduled_timer"] = t
+
+            bot.send_message(message.chat.id,
+                f"✅ Рассылка запланирована на {dt.strftime('%d.%m.%Y %H:%M')}\n"
+                f"Текст: {_bcast['text'][:80]}")
+        except ValueError:
+            bot.send_message(message.chat.id,
+                "❌ Неверный формат. Пример: <code>31.05.2026 18:00</code>", parse_mode="HTML")
+
+    # ── Start expiry watcher ──
+    Thread(target=_expiry_watcher, args=(cardinal,), daemon=True).start()
+    logger.info("AutoCode v5.0.0 инициализирован.")
 
 
-# ─── Хуки ────────────────────────────────────────────────────────────────────
+# ── Plugin hooks ─────────────────────────────────────────────────────────────
 BIND_TO_PRE_INIT    = [init_autocode_tg]
 BIND_TO_NEW_ORDER   = [on_new_order]
 BIND_TO_NEW_MESSAGE = [on_new_message]

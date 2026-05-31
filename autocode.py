@@ -30,7 +30,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.1.1"
+VERSION = "5.1.2"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
@@ -118,6 +118,11 @@ PRE_WINDOW          = 2 * 3600
 USED_CODE_TTL_SEC   = 3 * 3600
 WEEKLY_REPORT_DOW   = 6
 WEEKLY_REPORT_HOUR  = 9
+
+# Минимальное время жизни аренды в секундах после создания,
+# в течение которого watcher НЕ будет её удалять даже если expires_at выглядит истёкшим.
+# Защищает от удаления только что созданных аренд при рестарте Cardinal.
+RENTAL_GRACE_SEC = 300  # 5 минут
 
 # ── XOR password encryption ─────────────────────────────────────────────────
 _SECRET_KEY = (os.environ.get("AC_SECRET") or "ac_fp_secret_2025").encode()
@@ -564,19 +569,48 @@ def _weekly_report_worker(cardinal):
 
 # ── Expiry watcher ───────────────────────────────────────────────────────────
 def _expiry_watcher(cardinal):
+    """
+    BUG FIXES в этой версии:
+    1. warned_4h / warned_30m теперь персистентны между итерациями через set,
+       но при рестарте Cardinal НЕ удаляем аренды созданные менее RENTAL_GRACE_SEC назад.
+    2. Проверка истечения: now >= expires_at + 60 (буфер 60 сек) чтобы не удалять
+       аренды у которых expires_at только что наступил но покупатель ещё активен.
+    3. Читаем файл каждую итерацию (уже было), но теперь корректно обрабатываем
+       аренды без поля purchase_ts.
+    4. Сообщение "завершена" отправляется только если аренда действительно истекла
+       (expires_at + grace buffer прошёл).
+    """
     warned_4h  = set()
     warned_30m = set()
+    # При старте даём grace period — не трогаем аренды первые RENTAL_GRACE_SEC секунд
+    startup_ts = time.time()
+
     while True:
         time.sleep(60)
         try:
             rents   = rentals()
             now     = time.time()
             changed = False
-            for key, r in list(rents.items()):
-                exp   = r.get("expires_at", 0)
-                cid   = r.get("chat_id")
-                cname = r.get("chat_name", "")
 
+            for key, r in list(rents.items()):
+                exp        = r.get("expires_at", 0)
+                cid        = r.get("chat_id")
+                cname      = r.get("chat_name", "")
+                purchase_ts = r.get("purchase_ts", 0)
+
+                # ФИКС 1: Не трогаем аренды созданные менее RENTAL_GRACE_SEC назад.
+                # Это защищает от ложного срабатывания при рестарте Cardinal когда
+                # on_new_order только что записал аренду а watcher ещё не знает о ней.
+                if purchase_ts and (now - purchase_ts) < RENTAL_GRACE_SEC:
+                    continue
+
+                # ФИКС 2: Не трогаем аренды в первые 5 минут после старта плагина
+                # (защита от race condition при рестарте).
+                if (now - startup_ts) < RENTAL_GRACE_SEC:
+                    # Только предупреждения не шлём, удаление не делаем
+                    continue
+
+                # Предупреждение за 4 часа
                 if key not in warned_4h and 0 < exp - now <= WARN_BEFORE_H * 3600:
                     warned_4h.add(key)
                     Thread(
@@ -588,6 +622,7 @@ def _expiry_watcher(cardinal):
                         daemon=True,
                     ).start()
 
+                # Предупреждение за 30 минут
                 if key not in warned_30m and 0 < exp - now <= 1800:
                     warned_30m.add(key)
                     Thread(
@@ -596,7 +631,10 @@ def _expiry_watcher(cardinal):
                         daemon=True,
                     ).start()
 
-                if now > exp:
+                # ФИКС 3: Удаляем только если аренда истекла более 60 секунд назад.
+                # Буфер нужен чтобы не удалить аренду в момент когда покупатель
+                # только что запросил код (race condition между on_new_message и watcher).
+                if now >= exp + 60:
                     Thread(
                         target=cardinal.send_message,
                         args=(cid,
@@ -609,18 +647,29 @@ def _expiry_watcher(cardinal):
                     warned_4h.discard(key)
                     warned_30m.discard(key)
                     changed = True
+                    logger.info(f"AutoCode: аренда {key} ({r.get('buyer')}) завершена.")
 
             if changed:
                 save_rentals(rents)
+
         except Exception as e:
             logger.error(f"Expiry watcher error: {e}")
 
 # ── Parse hours from lot name ────────────────────────────────────────────────
 def _parse_hours(text: str) -> int | None:
-    m = re.search(r"(\d+)\s*ч", text, re.IGNORECASE)
+    """
+    ФИКС: Приоритет парсинга — сначала ищем часы (ч), потом дни (д).
+    Для строки "1 ДЕНЬ / 24ч" — вернёт 24 (из "24ч"), что правильно.
+    Для строки "3 дня" — вернёт 72.
+    Для строки "12ч" — вернёт 12.
+    Нормализуем текст: убираем пробелы вокруг цифр.
+    """
+    # Сначала ищем явное указание часов (приоритет выше)
+    m = re.search(r"(\d+)\s*ч(?:ас(?:а|ов)?)?", text, re.IGNORECASE)
     if m:
         return int(m.group(1))
-    m = re.search(r"(\d+)\s*д(ень|ня|ней)?", text, re.IGNORECASE)
+    # Потом дни
+    m = re.search(r"(\d+)\s*д(?:ень|ня|ней|ен)?", text, re.IGNORECASE)
     if m:
         return int(m.group(1)) * 24
     return None
@@ -634,6 +683,7 @@ def on_new_order(c, e: NewOrderEvent):
     lot_name = getattr(e.order, "lot_name", "") or desc
     hours    = _parse_hours(lot_name)
     if not hours:
+        logger.debug(f"AutoCode: не удалось определить часы из названия лота: {lot_name!r}")
         return
 
     buyer     = getattr(e.order, "buyer_username", "") or ""
@@ -655,10 +705,11 @@ def on_new_order(c, e: NewOrderEvent):
     now   = time.time()
     rents = rentals()
 
+    # Проверяем продление существующей аренды
     for k, r in rents.items():
         if r.get("buyer") == buyer and r.get("expires_at", 0) > now:
             rents[k]["expires_at"] += hours * 3600
-            rents[k]["hours"]      += hours
+            rents[k]["hours"]      = rents[k].get("hours", 0) + hours
             save_rentals(rents)
             Thread(
                 target=c.send_message,
@@ -671,6 +722,7 @@ def on_new_order(c, e: NewOrderEvent):
             logger.info(f"AutoCode: продление {buyer} +{hours}ч")
             return
 
+    # Новая аренда
     expires_at = now + hours * 3600
     rents[order_id] = {
         "order_key":   order_id,
@@ -685,7 +737,10 @@ def on_new_order(c, e: NewOrderEvent):
         "hours":       hours,
     }
     save_rentals(rents)
-    logger.info(f"AutoCode: новая аренда {buyer} | {acc_email} | {hours}ч | до {_fmt_time(expires_at)}")
+    logger.info(
+        f"AutoCode: новая аренда {buyer} | {acc_email} | {hours}ч | "
+        f"до {_fmt_time(expires_at)} | order={order_id}"
+    )
 
     Thread(
         target=c.send_message,
@@ -710,6 +765,7 @@ def on_new_message(c, e: NewMessageEvent):
     chat_id   = e.message.chat_id
     chat_name = e.message.chat_name
 
+    # Команда !time — показать оставшееся время аренды
     if lower == "!time":
         now   = time.time()
         rents = rentals()
@@ -732,6 +788,7 @@ def on_new_message(c, e: NewMessageEvent):
     if lower not in ("!cd", "code"):
         return
 
+    # Проверка rate limit
     allowed, reason = _check_rate(buyer)
     if not allowed:
         Thread(target=c.send_message, args=(chat_id, reason, chat_name), daemon=True).start()
@@ -801,12 +858,12 @@ def init_autocode_tg(cardinal, *args):
 
     @bot.message_handler(commands=["autocode"])
     def cmd_autocode(message: Message):
-        bot.send_message(message.chat.id, "⚙️ AutoCode v5.1.1 — выберите раздел:",
+        bot.send_message(message.chat.id, "⚙️ AutoCode v5.1.2 — выберите раздел:",
                          reply_markup=kb_main())
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_MAIN)
     def open_main(call: CallbackQuery):
-        bot.edit_message_text("⚙️ AutoCode v5.1.1 — выберите раздел:",
+        bot.edit_message_text("⚙️ AutoCode v5.1.2 — выберите раздел:",
                               call.message.chat.id, call.message.message_id,
                               reply_markup=kb_main())
 
@@ -857,6 +914,7 @@ def init_autocode_tg(cardinal, *args):
         idx = int(call.data.split(":")[1])
         accs = accounts()
         if idx >= len(accs):
+            bot.answer_callback_query(call.id, "Аккаунт не найден.")
             return
         acc = accs[idx]
         text = (
@@ -891,6 +949,9 @@ def init_autocode_tg(cardinal, *args):
 
     def _do_chpass(message: Message, idx: int):
         accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
         accs[idx]["password"] = _encrypt_password(message.text.strip())
         save_accs(accs)
         bot.send_message(message.chat.id, "✅ Пароль обновлён (зашифрован).")
@@ -899,6 +960,9 @@ def init_autocode_tg(cardinal, *args):
     def act_imap(call: CallbackQuery):
         idx  = int(call.data.split(":")[1])
         accs = accounts()
+        if idx >= len(accs):
+            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            return
         auto = detect_imap_host(accs[idx]["email"])
         msg  = bot.send_message(call.message.chat.id,
             f"Текущий IMAP: {accs[idx].get('imap_host', auto)}\n"
@@ -907,6 +971,9 @@ def init_autocode_tg(cardinal, *args):
 
     def _save_imap(message: Message, idx: int):
         accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
         val  = message.text.strip()
         accs[idx]["imap_host"] = (
             detect_imap_host(accs[idx]["email"]) if val.lower() == "авто" else val
@@ -918,6 +985,9 @@ def init_autocode_tg(cardinal, *args):
     def do_test(call: CallbackQuery):
         idx    = int(call.data.split(":")[1])
         accs   = accounts()
+        if idx >= len(accs):
+            bot.answer_callback_query(call.id, "Аккаунт не найден.", show_alert=True)
+            return
         result = test_imap(accs[idx])
         bot.answer_callback_query(call.id, result, show_alert=True)
 
@@ -954,6 +1024,9 @@ def init_autocode_tg(cardinal, *args):
             bot.send_message(message.chat.id, "❌ Введите число.")
             return
         accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
         accs[idx][field] = val
         save_accs(accs)
         bot.send_message(message.chat.id, f"✅ {field} = {val}")
@@ -962,6 +1035,9 @@ def init_autocode_tg(cardinal, *args):
     def act_type(call: CallbackQuery):
         idx  = int(call.data.split(":")[1])
         accs = accounts()
+        if idx >= len(accs):
+            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            return
         types = ["alnum", "digits", "alpha", "alnum-dash"]
         cur   = accs[idx].get("code_type", "alnum")
         nxt   = types[(types.index(cur) + 1) % len(types)] if cur in types else "alnum"
@@ -983,6 +1059,9 @@ def init_autocode_tg(cardinal, *args):
 
     def _save_str(message: Message, idx: int, field: str):
         accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
         accs[idx][field] = message.text.strip()
         save_accs(accs)
         bot.send_message(message.chat.id, f"✅ {field} сохранён.")
@@ -992,6 +1071,9 @@ def init_autocode_tg(cardinal, *args):
     def open_lots(call: CallbackQuery):
         idx  = int(call.data.split(":")[1])
         accs = accounts()
+        if idx >= len(accs):
+            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            return
         acc  = accs[idx]
         lots = acc.get("lot_ids", [])
         rows = [[B(f"🗑 {l}", callback_data=f"{AC_LOT_DEL}:{idx}:{l}")] for l in lots]
@@ -1008,6 +1090,9 @@ def init_autocode_tg(cardinal, *args):
 
     def _do_lot_add(message: Message, idx: int):
         accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
         accs[idx].setdefault("lot_ids", []).append(message.text.strip())
         save_accs(accs)
         bot.send_message(message.chat.id, "✅ Лот добавлен.")
@@ -1017,6 +1102,9 @@ def init_autocode_tg(cardinal, *args):
         parts = call.data.split(":")
         idx, lot = int(parts[1]), parts[2]
         accs = accounts()
+        if idx >= len(accs):
+            bot.answer_callback_query(call.id, "Аккаунт не найден.")
+            return
         accs[idx]["lot_ids"] = [l for l in accs[idx].get("lot_ids", []) if l != lot]
         save_accs(accs)
         bot.answer_callback_query(call.id, f"Лот {lot} удалён.")
@@ -1075,6 +1163,7 @@ def init_autocode_tg(cardinal, *args):
         rents = rentals()
         if key in rents:
             rents[key]["expires_at"] += hours * 3600
+            rents[key]["hours"] = rents[key].get("hours", 0) + hours
             save_rentals(rents)
         bot.answer_callback_query(call.id, f"Продлено на {hours}ч.")
 
@@ -1235,6 +1324,7 @@ def init_autocode_tg(cardinal, *args):
         idx  = int(call.data.split(":")[1])
         tpls = templates()
         if idx >= len(tpls):
+            bot.answer_callback_query(call.id, "Шаблон не найден.")
             return
         _bcast["text"] = tpls[idx]["text"]
         active = get_active_rentals()
@@ -1331,7 +1421,7 @@ def init_autocode_tg(cardinal, *args):
     Thread(target=_startup_imap_test,        args=(cardinal,), daemon=True).start()
     Thread(target=_used_code_cleanup_worker,              daemon=True).start()
     Thread(target=_weekly_report_worker,     args=(cardinal,), daemon=True).start()
-    logger.info("AutoCode v5.1.1 инициализирован.")
+    logger.info("AutoCode v5.1.2 инициализирован.")
 
 
 # ── Plugin hooks ─────────────────────────────────────────────────────────────

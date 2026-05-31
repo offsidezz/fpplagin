@@ -30,15 +30,15 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.1.0"
+VERSION = "5.1.1"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
     "Рассылка, аналитика, шаблоны, история рассылок, лимиты, авто-продление аренды.\n"
-    "Команда: /autocode"
+    "Управление: /autocode"
 )
 CREDITS = "@offsidezq"
-SETTINGS_PAGE = True
+SETTINGS_PAGE = False
 BIND_TO_DELETE = None
 
 logger = logging.getLogger("FPC.AutoCode")
@@ -110,22 +110,19 @@ IMAP_HOSTS = {
     "bk.ru":          "imap.mail.ru",
 }
 
-IMAP_TIMEOUT        = 15       # секунд на подключение
-CODE_CD             = 30       # кулдаун повторного запроса (сек)
-MAX_CODES_HOUR      = 10       # лимит запросов в час на покупателя
-WARN_BEFORE_H       = 4        # предупреждение за N часов до конца аренды
-PRE_WINDOW          = 2 * 3600 # окно до покупки для поиска писем
-USED_CODE_TTL_SEC   = 3 * 3600 # авто-очистка: удалять использованные коды старше 3 часов
-WEEKLY_REPORT_DOW   = 6        # день недели для еженедельного отчёта (0=пн, 6=вс)
-WEEKLY_REPORT_HOUR  = 9        # час отправки отчёта
+IMAP_TIMEOUT        = 15
+CODE_CD             = 30
+MAX_CODES_HOUR      = 10
+WARN_BEFORE_H       = 4
+PRE_WINDOW          = 2 * 3600
+USED_CODE_TTL_SEC   = 3 * 3600
+WEEKLY_REPORT_DOW   = 6
+WEEKLY_REPORT_HOUR  = 9
 
-# ── Простое XOR-шифрование паролей ─────────────────────────────────────────
-# Ключ берётся из переменной окружения AC_SECRET или фиксированного дефолта.
-# Не является криптографически стойким, но скрывает пароли от случайного просмотра файла.
+# ── XOR password encryption ─────────────────────────────────────────────────
 _SECRET_KEY = (os.environ.get("AC_SECRET") or "ac_fp_secret_2025").encode()
 
 def _xor_crypt(data: str) -> str:
-    """Шифрует/расшифровывает строку XOR + base64."""
     raw   = data.encode("utf-8")
     key   = _SECRET_KEY
     xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
@@ -141,7 +138,7 @@ def _decrypt_password(enc: str) -> str:
         xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
         return xored.decode("utf-8")
     except Exception:
-        return enc  # если не удалось расшифровать — вернуть как есть (plain-текст, совместимость)
+        return enc
 
 _cardinal_ref = None
 
@@ -281,7 +278,6 @@ def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
     filter_from = acc.get("filter_from", "")
     filter_subj = acc.get("filter_subj", "")
 
-    # used_codes теперь хранит [{code, used_at}] — извлекаем только строки кодов
     raw_used = used.get(email_addr, [])
     used_set = set()
     for entry in raw_used:
@@ -502,8 +498,7 @@ def _notify_tg_rate_limit(cardinal, buyer, count):
 
 # ── IMAP startup test ────────────────────────────────────────────────────────
 def _startup_imap_test(cardinal):
-    """Проверяет все аккаунты при запуске и шлёт TG-алерт если что-то сломано."""
-    time.sleep(5)  # дать Cardinal время инициализироваться
+    time.sleep(5)
     accs = accounts()
     if not accs:
         return
@@ -519,9 +514,8 @@ def _startup_imap_test(cardinal):
     else:
         logger.info(f"AutoCode: все {len(accs)} IMAP-аккаунтов прошли проверку при старте.")
 
-# ── Авто-очистка использованных кодов (TTL 3 часа) ──────────────────────────
+# ── Used-code cleanup (TTL 3h) ───────────────────────────────────────────────
 def _used_code_cleanup_worker():
-    """Раз в час удаляет из used_codes.json записи старше USED_CODE_TTL_SEC."""
     while True:
         time.sleep(3600)
         try:
@@ -537,7 +531,6 @@ def _used_code_cleanup_worker():
                         else:
                             changed = True
                     else:
-                        # старый формат (plain string) — конвертируем с текущим временем
                         new_entries.append({"code": entry, "used_at": now})
                         changed = True
                 used[email_addr] = new_entries
@@ -547,12 +540,10 @@ def _used_code_cleanup_worker():
         except Exception as e:
             logger.error(f"Used-code cleanup error: {e}")
 
-# ── Еженедельный отчёт ───────────────────────────────────────────────────────
+# ── Weekly report ────────────────────────────────────────────────────────────
 def _weekly_report_worker(cardinal):
-    """Каждое воскресенье в WEEKLY_REPORT_HOUR шлёт сводный отчёт в TG."""
     while True:
         now = datetime.now()
-        # Следующий WEEKLY_REPORT_DOW в WEEKLY_REPORT_HOUR:00
         days_ahead = (WEEKLY_REPORT_DOW - now.weekday()) % 7
         if days_ahead == 0 and now.hour >= WEEKLY_REPORT_HOUR:
             days_ahead = 7
@@ -664,7 +655,6 @@ def on_new_order(c, e: NewOrderEvent):
     now   = time.time()
     rents = rentals()
 
-    # Авто-продление: если у покупателя уже есть активная аренда — продлеваем
     for k, r in rents.items():
         if r.get("buyer") == buyer and r.get("expires_at", 0) > now:
             rents[k]["expires_at"] += hours * 3600
@@ -697,11 +687,10 @@ def on_new_order(c, e: NewOrderEvent):
     save_rentals(rents)
     logger.info(f"AutoCode: новая аренда {buyer} | {acc_email} | {hours}ч | до {_fmt_time(expires_at)}")
 
-    # Уведомление о старте аренды
     Thread(
         target=c.send_message,
         args=(chat_id,
-              f"🌸 | Аренда активирована, напиши команду в чат: !cd или code",
+              "🌸 | Аренда активирована, напиши команду в чат: !cd или code",
               chat_name),
         daemon=True,
     ).start()
@@ -721,7 +710,6 @@ def on_new_message(c, e: NewMessageEvent):
     chat_id   = e.message.chat_id
     chat_name = e.message.chat_name
 
-    # ── Команда !time — показать остаток аренды ──
     if lower == "!time":
         now   = time.time()
         rents = rentals()
@@ -741,11 +729,9 @@ def on_new_message(c, e: NewMessageEvent):
         Thread(target=c.send_message, args=(chat_id, reply, chat_name), daemon=True).start()
         return
 
-    # ── Команды !cd / code — выдача кода ──
     if lower not in ("!cd", "code"):
         return
 
-    # Rate limit / cooldown
     allowed, reason = _check_rate(buyer)
     if not allowed:
         Thread(target=c.send_message, args=(chat_id, reason, chat_name), daemon=True).start()
@@ -754,7 +740,6 @@ def on_new_message(c, e: NewMessageEvent):
             Thread(target=_notify_tg_rate_limit, args=(c, buyer, len(reqs)), daemon=True).start()
         return
 
-    # Проверяем активную аренду
     now   = time.time()
     rents = rentals()
     active = sorted(
@@ -797,7 +782,6 @@ def on_new_message(c, e: NewMessageEvent):
         ).start()
         return
 
-    # Сохраняем с временной меткой (новый формат)
     entry = {"code": code_val, "used_at": time.time()}
     used.setdefault(acc_email, []).append(entry)
     save_used(used)
@@ -815,16 +799,16 @@ def init_autocode_tg(cardinal, *args):
 
     _bcast = {"text": "", "failed": [], "scheduled_timer": None}
 
-    # /autocode command
     @bot.message_handler(commands=["autocode"])
     def cmd_autocode(message: Message):
-        bot.send_message(message.chat.id, "⚙️ AutoCode v5.1", reply_markup=kb_main())
+        bot.send_message(message.chat.id, "⚙️ AutoCode v5.1.1 — выберите раздел:",
+                         reply_markup=kb_main())
 
-    # Main menu
     @bot.callback_query_handler(func=lambda c: c.data == AC_MAIN)
     def open_main(call: CallbackQuery):
-        bot.edit_message_text("⚙️ AutoCode v5.1", call.message.chat.id,
-                              call.message.message_id, reply_markup=kb_main())
+        bot.edit_message_text("⚙️ AutoCode v5.1.1 — выберите раздел:",
+                              call.message.chat.id, call.message.message_id,
+                              reply_markup=kb_main())
 
     # ── Account list ──
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LIST}:"))
@@ -838,7 +822,6 @@ def init_autocode_tg(cardinal, *args):
         bot.edit_message_text("📬 Почтовые аккаунты:", call.message.chat.id,
                               call.message.message_id, reply_markup=K(keyboard=rows))
 
-    # ── Add account ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_ADD)
     def act_add(call: CallbackQuery):
         msg = bot.send_message(call.message.chat.id, "Введите email:")
@@ -857,7 +840,7 @@ def init_autocode_tg(cardinal, *args):
         save_accs(accs)
         idx = len(accs) - 1
         msg = bot.send_message(message.chat.id,
-            f"✅ Добавлен. IMAP определён автоматически: {auto_host}\nВведите пароль:")
+            f"✅ Добавлен. IMAP: {auto_host}\nВведите пароль:")
         bot.register_next_step_handler(msg, lambda m: _step_pass(m, idx))
 
     def _step_pass(message: Message, idx: int):
@@ -866,10 +849,9 @@ def init_autocode_tg(cardinal, *args):
         accs[idx]["password"] = _encrypt_password(plain)
         save_accs(accs)
         bot.send_message(message.chat.id,
-            f"✅ Пароль сохранён (зашифрован).\nIMAP: {accs[idx]['imap_host']}\n"
-            f"Используйте /autocode → редактировать для дополнительных настроек.")
+            f"✅ Пароль сохранён (зашифрован).\n"
+            f"Используйте /autocode → 📬 Список почт → аккаунт для дополнительных настроек.")
 
-    # ── Edit account ──
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_EDIT}:"))
     def open_edit(call: CallbackQuery):
         idx = int(call.data.split(":")[1])
@@ -885,19 +867,19 @@ def init_autocode_tg(cardinal, *args):
             f"Длина: {acc.get('code_len', 0) or 'авто'}\n"
             f"📬 От: {acc.get('filter_from') or '—'} | "
             f"Тема: {acc.get('filter_subj') or '—'}\n"
-            f"🔐 Пароль: {'зашифрован' if acc.get('password') else 'не задан'}"
+            f"🔐 Пароль: {'зашифрован ✅' if acc.get('password') else 'не задан ❌'}"
         )
         kb = K(keyboard=[
-            [B("🔌 IMAP хост",  callback_data=f"{AC_IMAP}:{idx}"),
-             B("📦 Лоты",       callback_data=f"{AC_LOTS}:{idx}")],
-            [B("🔢 Длина кода", callback_data=f"{AC_LEN}:{idx}"),
-             B("🔤 Тип кода",   callback_data=f"{AC_TYPE}:{idx}")],
-            [B("📬 От (from)",  callback_data=f"{AC_FROM}:{idx}"),
-             B("📌 Тема",       callback_data=f"{AC_SUBJ}:{idx}")],
+            [B("🔌 IMAP хост",      callback_data=f"{AC_IMAP}:{idx}"),
+             B("📦 Лоты",           callback_data=f"{AC_LOTS}:{idx}")],
+            [B("🔢 Длина кода",     callback_data=f"{AC_LEN}:{idx}"),
+             B("🔤 Тип кода",       callback_data=f"{AC_TYPE}:{idx}")],
+            [B("📬 От (from)",      callback_data=f"{AC_FROM}:{idx}"),
+             B("📌 Тема",           callback_data=f"{AC_SUBJ}:{idx}")],
             [B("🔑 Сменить пароль", callback_data=f"ac_chpass:{idx}"),
-             B("🔍 Тест IMAP",  callback_data=f"{AC_TEST}:{idx}")],
-            [B("🗑 Удалить",    callback_data=f"{AC_DEL_ASK}:{idx}")],
-            [B("◀ Назад",       callback_data=f"{AC_LIST}:0")],
+             B("🔍 Тест IMAP",      callback_data=f"{AC_TEST}:{idx}")],
+            [B("🗑 Удалить",        callback_data=f"{AC_DEL_ASK}:{idx}")],
+            [B("◀ Назад",           callback_data=f"{AC_LIST}:0")],
         ])
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
@@ -975,6 +957,17 @@ def init_autocode_tg(cardinal, *args):
         accs[idx][field] = val
         save_accs(accs)
         bot.send_message(message.chat.id, f"✅ {field} = {val}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_TYPE}:"))
+    def act_type(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        types = ["alnum", "digits", "alpha", "alnum-dash"]
+        cur   = accs[idx].get("code_type", "alnum")
+        nxt   = types[(types.index(cur) + 1) % len(types)] if cur in types else "alnum"
+        accs[idx]["code_type"] = nxt
+        save_accs(accs)
+        bot.answer_callback_query(call.id, f"Тип кода: {nxt}")
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_FROM}:"))
     def act_from(call: CallbackQuery):
@@ -1333,12 +1326,12 @@ def init_autocode_tg(cardinal, *args):
             bot.send_message(message.chat.id,
                 "❌ Неверный формат. Пример: <code>31.05.2026 18:00</code>", parse_mode="HTML")
 
-    # ── Запуск фоновых воркеров ──
+    # ── Background workers ──
     Thread(target=_expiry_watcher,           args=(cardinal,), daemon=True).start()
     Thread(target=_startup_imap_test,        args=(cardinal,), daemon=True).start()
     Thread(target=_used_code_cleanup_worker,              daemon=True).start()
     Thread(target=_weekly_report_worker,     args=(cardinal,), daemon=True).start()
-    logger.info("AutoCode v5.1.0 инициализирован.")
+    logger.info("AutoCode v5.1.1 инициализирован.")
 
 
 # ── Plugin hooks ─────────────────────────────────────────────────────────────

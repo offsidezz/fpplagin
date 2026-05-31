@@ -34,11 +34,11 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.2.1"
+VERSION = "5.2.2"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
-    "v5.2.1: компактные аренды, фикс кнопок статистики.\n"
+    "v5.2.2: фикс TypeError в статистике, быстрая навигация по страницам аренд.\n"
     "Управление: /autocode"
 )
 CREDITS = "@offsidezq"
@@ -210,6 +210,35 @@ def _save(path, data):
     except Exception as e:
         logger.error(f"AutoCode: не удалось сохранить {path}: {e}")
 
+def _safe_ts(value) -> float:
+    """Robust float conversion: handles int, float, ISO strings, dd.mm.YYYY, garbage."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return 0.0
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(s, fmt).timestamp()
+            except Exception:
+                continue
+        try:
+            return parsedate_to_datetime(s).timestamp()
+        except Exception:
+            return 0.0
+    return 0.0
+
 def accounts():            return _load(ACCOUNTS_FILE, [])
 def save_accs(d):          _save(ACCOUNTS_FILE, d)
 def used_codes():          return _load(USED_FILE, {})
@@ -250,18 +279,18 @@ def add_log(email_addr, lot_id, buyer, code, chat_id=None):
     _save(LOG_FILE, entries[-500:])
 
 def _fmt_time(ts):
-    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+    return datetime.fromtimestamp(_safe_ts(ts)).strftime("%d.%m.%Y %H:%M")
 
 def _fmt_time_short(ts):
-    return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+    return datetime.fromtimestamp(_safe_ts(ts)).strftime("%d.%m %H:%M")
 
 def _fmt_remaining(ts):
-    left = max(0, int(ts - time.time()))
+    left = max(0, int(_safe_ts(ts) - time.time()))
     h, m = divmod(left // 60, 60)
     return f"{h}ч {m:02d}м"
 
 def _fmt_remaining_compact(ts):
-    left = max(0, int(ts - time.time()))
+    left = max(0, int(_safe_ts(ts) - time.time()))
     h, m = divmod(left // 60, 60)
     if h >= 24:
         d, h = divmod(h, 24)
@@ -437,7 +466,7 @@ def fetch_code(acc, used, not_before_ts=None) -> tuple[str | None, str | None]:
 
         cutoff = time.time() - max_age * 60
         if not_before_ts:
-            cutoff = min(cutoff, not_before_ts - PRE_WINDOW)
+            cutoff = min(cutoff, _safe_ts(not_before_ts) - PRE_WINDOW)
 
         for mid in reversed(msg_ids[-50:]):
             try:
@@ -532,14 +561,14 @@ _imap_queue = IMAPQueue()
 
 def get_active_rentals() -> list:
     now = time.time()
-    return [r for r in rentals().values() if r.get("expires_at", 0) > now]
+    return [r for r in rentals().values() if _safe_ts(r.get("expires_at", 0)) > now]
 
 def get_expiring_rentals(within_hours: float) -> list:
     now = time.time()
     cutoff = now + within_hours * 3600
     return [
         r for r in rentals().values()
-        if now < r.get("expires_at", 0) <= cutoff
+        if now < _safe_ts(r.get("expires_at", 0)) <= cutoff
     ]
 
 _code_requests: dict[str, list[float]] = {}
@@ -608,26 +637,34 @@ def kb_templates(tpls):
 def _filter_log_by_hours(hours):
     entries = log_entries()
     if hours is None:
-        return entries
+        return [e for e in entries if _safe_ts(e.get("time", 0)) > 0]
     cutoff = time.time() - hours * 3600
-    return [e for e in entries if e.get("time", 0) >= cutoff]
+    return [e for e in entries if _safe_ts(e.get("time", 0)) >= cutoff]
 
 def _filter_log_by_range(date_from, date_to):
     entries = log_entries()
-    return [
-        e for e in entries
-        if date_from.timestamp() <= e.get("time", 0) <= date_to.timestamp()
-    ]
+    df_ts = date_from.timestamp()
+    dt_ts = date_to.timestamp()
+    out = []
+    for e in entries:
+        ts = _safe_ts(e.get("time", 0))
+        if df_ts <= ts <= dt_ts:
+            out.append(e)
+    return out
 
 def _stats_text(entries, label: str) -> str:
     total    = len(entries)
     by_email = Counter(e.get("email") for e in entries if e.get("email"))
     by_buyer = Counter(e.get("buyer") for e in entries if e.get("buyer"))
 
-    hours_list = [
-        datetime.fromtimestamp(e["time"]).hour
-        for e in entries if "time" in e
-    ]
+    hours_list = []
+    for e in entries:
+        ts = _safe_ts(e.get("time", 0))
+        if ts > 0:
+            try:
+                hours_list.append(datetime.fromtimestamp(ts).hour)
+            except Exception:
+                continue
     peak = Counter(hours_list).most_common(3)
     peak_str = ", ".join(f"{h:02d}:00 ({c})" for h, c in peak) or "—"
 
@@ -813,7 +850,7 @@ def _startup_sales_scan(cardinal):
                 last    = shortcuts[-1]
                 last_ts = None
                 if hasattr(last, "date_ts"):
-                    last_ts = last.date_ts
+                    last_ts = _safe_ts(last.date_ts)
                 elif hasattr(last, "date") and last.date:
                     try:
                         last_ts = last.date.timestamp()
@@ -840,9 +877,14 @@ def _startup_sales_scan(cardinal):
         accs     = accounts()
         restored = 0
         skipped  = 0
+        skip_no_hours    = 0
+        skip_no_acc      = 0
+        skip_expired     = 0
+        skip_existing    = 0
+        skip_no_purchase = 0
         no_chat  = 0
 
-        existing_order_ids = {r.get("order_id") for r in rents.values()}
+        existing_order_ids = {str(r.get("order_id")) for r in rents.values() if r.get("order_id")}
 
         for shortcut in all_shortcuts:
             try:
@@ -863,7 +905,7 @@ def _startup_sales_scan(cardinal):
 
                 purchase_ts = None
                 if hasattr(shortcut, "date_ts"):
-                    purchase_ts = shortcut.date_ts
+                    purchase_ts = _safe_ts(shortcut.date_ts)
                 elif hasattr(shortcut, "date") and shortcut.date:
                     try:
                         purchase_ts = shortcut.date.timestamp()
@@ -872,6 +914,7 @@ def _startup_sales_scan(cardinal):
 
                 if not purchase_ts:
                     skipped += 1
+                    skip_no_purchase += 1
                     continue
 
                 if purchase_ts < cutoff:
@@ -880,17 +923,20 @@ def _startup_sales_scan(cardinal):
 
                 if order_id and order_id in existing_order_ids:
                     skipped += 1
+                    skip_existing += 1
                     continue
 
                 hours = _parse_hours(lot_name)
                 if not hours:
                     skipped += 1
+                    skip_no_hours += 1
                     continue
 
                 expires_at = purchase_ts + hours * 3600
 
                 if expires_at <= now:
                     skipped += 1
+                    skip_expired += 1
                     continue
 
                 acc_email = None
@@ -901,6 +947,7 @@ def _startup_sales_scan(cardinal):
 
                 if not acc_email:
                     skipped += 1
+                    skip_no_acc += 1
                     continue
 
                 chat_name = buyer
@@ -941,16 +988,29 @@ def _startup_sales_scan(cardinal):
         if restored > 0:
             save_rentals(rents)
 
-        logger.info(
+        diag = (
             f"AutoCode: сканирование завершено. "
-            f"Восстановлено: {restored} (без chat_id: {no_chat}), пропущено: {skipped}."
+            f"Восстановлено: {restored} (без chat_id: {no_chat}), пропущено: {skipped} "
+            f"[нет часов: {skip_no_hours}, нет акк: {skip_no_acc}, "
+            f"истёк: {skip_expired}, уже есть: {skip_existing}, нет даты: {skip_no_purchase}]."
         )
+        logger.info(diag)
 
         if restored > 0:
             extra = f"\n⚠️ Без chat_id: {no_chat}" if no_chat else ""
             _notify_tg(cardinal,
                 f"✅ AutoCode: восстановлено {restored} активных аренд "
                 f"из истории продаж за 30 дней.{extra}"
+            )
+        elif skip_no_hours > 0:
+            _notify_tg(cardinal,
+                f"⚠️ AutoCode: 0 аренд восстановлено.\n"
+                f"Причина: в названиях лотов не найдены часы/дни.\n"
+                f"Проверено: {len(all_shortcuts)} заказов.\n"
+                f"Без часов: {skip_no_hours}\n"
+                f"Без аккаунта: {skip_no_acc}\n"
+                f"Уже истёк: {skip_expired}\n\n"
+                f"Скинь 2-3 названия лотов — допишу парсер."
             )
 
     except Exception as e:
@@ -970,7 +1030,7 @@ def _used_code_cleanup_worker():
                 new_entries = []
                 for entry in entries:
                     if isinstance(entry, dict):
-                        if now - entry.get("used_at", 0) < USED_CODE_TTL_SEC:
+                        if now - _safe_ts(entry.get("used_at", 0)) < USED_CODE_TTL_SEC:
                             new_entries.append(entry)
                         else:
                             changed = True
@@ -1038,10 +1098,10 @@ def _expiry_watcher(cardinal):
                     state_dirty = True
 
             for key, r in list(rents.items()):
-                exp         = r.get("expires_at", 0)
+                exp         = _safe_ts(r.get("expires_at", 0))
                 cid         = r.get("chat_id")
                 cname       = r.get("chat_name", "")
-                purchase_ts = r.get("purchase_ts", 0)
+                purchase_ts = _safe_ts(r.get("purchase_ts", 0))
                 lang        = r.get("lang", "ru")
 
                 if purchase_ts and (now - purchase_ts) < RENTAL_GRACE_SEC:
@@ -1119,7 +1179,7 @@ def _winback_worker(cardinal):
                     b = e.get("buyer")
                     if not b:
                         continue
-                    ts = e.get("time", 0)
+                    ts = _safe_ts(e.get("time", 0))
                     cid = e.get("chat_id")
                     if b not in last_by_buyer or ts > last_by_buyer[b][0]:
                         last_by_buyer[b] = (ts, cid)
@@ -1180,7 +1240,7 @@ def _schedule_review_request(cardinal, chat_id, chat_name, buyer, lang):
             if not settings.get("review_enabled", True):
                 return
             still_active = any(
-                r.get("buyer") == buyer and r.get("expires_at", 0) > time.time()
+                r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > time.time()
                 for r in rentals().values()
             )
             if not still_active:
@@ -1223,18 +1283,48 @@ def _backup_worker():
             logger.error(f"Backup worker error: {e}")
 
 def _parse_hours(text: str) -> int | None:
-    m = re.search(r"(\d+)\s*ч(?:ас(?:а|ов)?)?", text, re.IGNORECASE)
+    if not text:
+        return None
+    s = text.lower()
+
+    # Years
+    m = re.search(r"(\d+)\s*(?:год|года|лет|y|year|years)\b", s)
     if m:
-        return int(m.group(1))
-    m = re.search(r"(\d+)\s*д(?:ень|ня|ней|ен)?", text, re.IGNORECASE)
+        return int(m.group(1)) * 24 * 365
+
+    # Months
+    m = re.search(r"(\d+)\s*(?:месяц|месяца|месяцев|мес\.?|month|months|mo)\b", s)
+    if m:
+        return int(m.group(1)) * 24 * 30
+
+    if re.search(r"\bмесяц\b", s) and not re.search(r"\d+\s*месяц", s):
+        return 24 * 30
+
+    # Weeks
+    m = re.search(r"(\d+)\s*(?:неделя|недели|недель|нед\.?|week|weeks|w)\b", s)
+    if m:
+        return int(m.group(1)) * 24 * 7
+    if re.search(r"\bнеделя\b", s) and not re.search(r"\d+\s*недел", s):
+        return 24 * 7
+
+    # Days
+    m = re.search(r"(\d+)\s*(?:день|дня|дней|сутки|суток|д\.?|d|day|days)\b", s)
     if m:
         return int(m.group(1)) * 24
-    m = re.search(r"(\d+)\s*h(?:our|ours)?", text, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"(\d+)\s*d(?:ay|ays)?", text, re.IGNORECASE)
+    m = re.search(r"(\d+)\s*д(?:ень|ня|ней|ен)?(?:\b|[^а-яё])", s)
     if m:
         return int(m.group(1)) * 24
+    if re.search(r"\bсутки\b", s) and not re.search(r"\d+\s*сут", s):
+        return 24
+
+    # Hours
+    m = re.search(r"(\d+)\s*(?:час|часа|часов|ч\.?|h|hour|hours|hr)\b", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*ч(?:ас(?:а|ов)?)?(?:\b|[^а-яё])", s)
+    if m:
+        return int(m.group(1))
+
     return None
 
 def _graceful_shutdown(*args):
@@ -1256,7 +1346,7 @@ def on_new_order(c, e: NewOrderEvent):
 
     desc     = getattr(e.order, "description", "") or ""
     lot_name = getattr(e.order, "lot_name", "") or desc
-    hours    = _parse_hours(lot_name)
+    hours    = _parse_hours(lot_name) or _parse_hours(desc)
     if not hours:
         logger.debug(f"AutoCode: не удалось определить часы: {lot_name!r}")
         return
@@ -1283,8 +1373,8 @@ def on_new_order(c, e: NewOrderEvent):
     rents = rentals()
 
     for k, r in rents.items():
-        if r.get("buyer") == buyer and r.get("expires_at", 0) > now:
-            rents[k]["expires_at"] += hours * 3600
+        if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > now:
+            rents[k]["expires_at"] = _safe_ts(rents[k].get("expires_at", 0)) + hours * 3600
             rents[k]["hours"]      = rents[k].get("hours", 0) + hours
             save_rentals(rents)
             state = warned_state()
@@ -1349,7 +1439,7 @@ def on_new_message(c, e: NewMessageEvent):
     rents = rentals()
     rents_changed = False
     for k, r in rents.items():
-        if r.get("buyer") == buyer and r.get("expires_at", 0) > time.time():
+        if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > time.time():
             if not r.get("chat_id"):
                 rents[k]["chat_id"]   = chat_id
                 rents[k]["chat_name"] = chat_name
@@ -1363,8 +1453,8 @@ def on_new_message(c, e: NewMessageEvent):
     if lower in ("!time", "time", "!время", "время"):
         now = time.time()
         active = sorted(
-            [r for r in rents.values() if r.get("buyer") == buyer and r.get("expires_at", 0) > now],
-            key=lambda r: r.get("purchase_ts", 0),
+            [r for r in rents.values() if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > now],
+            key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
             reverse=True,
         )
         if not active:
@@ -1390,8 +1480,8 @@ def on_new_message(c, e: NewMessageEvent):
 
     now = time.time()
     active = sorted(
-        [r for r in rents.values() if r.get("buyer") == buyer and r.get("expires_at", 0) > now],
-        key=lambda r: r.get("purchase_ts", 0),
+        [r for r in rents.values() if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > now],
+        key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
         reverse=True,
     )
 
@@ -1426,7 +1516,7 @@ def on_new_message(c, e: NewMessageEvent):
         ).start()
 
     used = used_codes()
-    not_before_ts = rental.get("purchase_ts", 0)
+    not_before_ts = _safe_ts(rental.get("purchase_ts", 0))
 
     def _on_result(result):
         code_val, err = result
@@ -1727,15 +1817,15 @@ def init_autocode_tg(cardinal, *args):
         if not entries:
             text = "Лог пуст."
         else:
-            lines = [
-                f"{_fmt_time(e['time'])} | {e['buyer']} | {e['code']}"
-                for e in reversed(entries)
-            ]
+            lines = []
+            for e in reversed(entries):
+                ts = _safe_ts(e.get("time", 0))
+                lines.append(f"{_fmt_time(ts)} | {e.get('buyer', '?')} | {e.get('code', '?')}")
             text = "📜 Последние выдачи:\n\n" + "\n".join(lines)
         _safe_edit(bot, call, text,
             K(keyboard=[[B("◀ Назад", callback_data=AC_MAIN)]]))
 
-    # ── Rentals (компактные, с пагинацией) ──
+    # ── Rentals (компактные, с пагинацией + first/last) ──
     @bot.callback_query_handler(func=lambda c: c.data == AC_RENTALS or c.data.startswith(f"{AC_RENT_PAGE}:"))
     def open_rentals(call: CallbackQuery):
         try:
@@ -1743,7 +1833,7 @@ def init_autocode_tg(cardinal, *args):
         except Exception:
             page = 0
 
-        active = sorted(get_active_rentals(), key=lambda r: r.get("expires_at", 0))
+        active = sorted(get_active_rentals(), key=lambda r: _safe_ts(r.get("expires_at", 0)))
         total  = len(active)
 
         if total == 0:
@@ -1767,16 +1857,17 @@ def init_autocode_tg(cardinal, *args):
             lang     = r.get("lang", "ru")
             lang_tag = "🇷🇺" if lang == "ru" else "🇬🇧"
             lines.append(f"{lang_tag} {buyer} • ⏳{remain} {warn}")
-            # одна кнопка-управление на аренду — открывает карточку
             rows.append([B(f"⚙️ {buyer}", callback_data=f"{AC_RENT_INFO}:{r['order_key']}")])
 
-        # пагинация
+        # Пагинация: ⏮ ◀ N/T ▶ ⏭
         nav = []
         if page > 0:
+            nav.append(B("⏮", callback_data=f"{AC_RENT_PAGE}:0"))
             nav.append(B("◀", callback_data=f"{AC_RENT_PAGE}:{page - 1}"))
         nav.append(B(f"🔄 {page + 1}/{pages_total}", callback_data=f"{AC_RENT_PAGE}:{page}"))
         if page < pages_total - 1:
             nav.append(B("▶", callback_data=f"{AC_RENT_PAGE}:{page + 1}"))
+            nav.append(B("⏭", callback_data=f"{AC_RENT_PAGE}:{pages_total - 1}"))
         if nav:
             rows.append(nav)
 
@@ -1819,7 +1910,6 @@ def init_autocode_tg(cardinal, *args):
         rents.pop(key, None)
         save_rentals(rents)
         _safe_answer(bot, call, "Аренда удалена.")
-        # вернуться в список
         call.data = f"{AC_RENT_PAGE}:0"
         open_rentals(call)
 
@@ -1829,7 +1919,7 @@ def init_autocode_tg(cardinal, *args):
         key, hours = parts[1], int(parts[2])
         rents = rentals()
         if key in rents:
-            rents[key]["expires_at"] += hours * 3600
+            rents[key]["expires_at"] = _safe_ts(rents[key].get("expires_at", 0)) + hours * 3600
             rents[key]["hours"] = rents[key].get("hours", 0) + hours
             save_rentals(rents)
             state = warned_state()
@@ -1838,7 +1928,6 @@ def init_autocode_tg(cardinal, *args):
                     state[s_key].remove(key)
             save_warned(state)
         _safe_answer(bot, call, f"Продлено на {hours}ч.")
-        # обновить карточку
         call.data = f"{AC_RENT_INFO}:{key}"
         rent_info(call)
 
@@ -1893,9 +1982,9 @@ def init_autocode_tg(cardinal, *args):
             )
             bot.send_message(message.chat.id, text,
                 reply_markup=K(keyboard=[[B("◀ Назад", callback_data=AC_STATS)]]))
-        except Exception:
+        except Exception as ex:
             bot.send_message(message.chat.id,
-                "❌ Неверный формат. Пример: <code>01.05.2026-31.05.2026</code>",
+                f"❌ Ошибка: {ex}\nПример: <code>01.05.2026-31.05.2026</code>",
                 parse_mode="HTML")
 
     # ── Health ──
@@ -2007,7 +2096,7 @@ def init_autocode_tg(cardinal, *args):
             b = e.get("buyer")
             if not b:
                 continue
-            ts = e.get("time", 0)
+            ts = _safe_ts(e.get("time", 0))
             if b not in last_by_buyer or ts > last_by_buyer[b]:
                 last_by_buyer[b] = ts
         active_buyers = {r.get("buyer") for r in get_active_rentals()}
@@ -2181,11 +2270,13 @@ def init_autocode_tg(cardinal, *args):
         if not hist:
             text = "История рассылок пуста."
         else:
-            lines = [
-                f"{_fmt_time(h['time'])} | ✅{h['sent']} ❌{h['failed']}\n"
-                f"  {h['text'][:60]}{'...' if len(h['text']) > 60 else ''}"
-                for h in reversed(hist)
-            ]
+            lines = []
+            for h in reversed(hist):
+                ts = _safe_ts(h.get("time", 0))
+                lines.append(
+                    f"{_fmt_time(ts)} | ✅{h.get('sent', 0)} ❌{h.get('failed', 0)}\n"
+                    f"  {h.get('text', '')[:60]}{'...' if len(h.get('text', '')) > 60 else ''}"
+                )
             text = "📋 История рассылок:\n\n" + "\n\n".join(lines)
         _safe_edit(bot, call, text,
             K(keyboard=[[B("◀ Назад", callback_data=AC_BROADCAST)]]))
@@ -2267,7 +2358,7 @@ def _winback_manual_run(cardinal):
             b = e.get("buyer")
             if not b:
                 continue
-            ts = e.get("time", 0)
+            ts = _safe_ts(e.get("time", 0))
             cid = e.get("chat_id")
             if b not in last_by_buyer or ts > last_by_buyer[b][0]:
                 last_by_buyer[b] = (ts, cid)

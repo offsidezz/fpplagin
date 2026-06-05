@@ -1,1 +1,1 @@
-I need to fetch this from https://raw.githubusercontent.com/offsidezz/fpplagin/3cf044a571f98f8479fc6e2bc0d84e53c03026de/autocode.py but I don't have the tools to do so
+I need to first fetch the file content from the URL before setting it. Let me get the content first.

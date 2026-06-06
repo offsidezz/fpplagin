@@ -1114,7 +1114,8 @@ def _startup_sales_scan(cardinal):
         for shortcut in all_shortcuts:
             try:
                 order_id  = str(getattr(shortcut, "id", "") or getattr(shortcut, "order_id", ""))
-                lot_name  = str(getattr(shortcut, "description", "") or getattr(shortcut, "lot_name", "") or "")
+                lot_name = getattr(shortcut, "description", None) or getattr(shortcut, "lot_name", None) or ""
+                logger.debug(f"Restore lot_name: {lot_name!r}")
                 buyer     = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
                 lot_id    = str(getattr(shortcut, "lot_id", "") or "")
 
@@ -1526,7 +1527,7 @@ def _parse_hours(text: str) -> int | None:
     if re.search(r"\bмесяц\b", s) and not re.search(r"\d+\s*месяц", s):
         return 24 * 30
 
-    m = re.search(r"(\d+)\s*(?:неделя|недели|недель|нед\.?|week|weeks|w)\b", s)
+    m = re.search(r"(?<![+➕])(\d+)\s*(?:неделя|недели|недель|нед\.?|week|weeks)\b", s)
     if m:
         return int(m.group(1)) * 24 * 7
     if re.search(r"\bнеделя\b", s) and not re.search(r"\d+\s*недел", s):
@@ -1535,16 +1536,16 @@ def _parse_hours(text: str) -> int | None:
     m = re.search(r"(\d+)\s*(?:день|дня|дней|сутки|суток|д\.?|d|day|days)\b", s)
     if m:
         return int(m.group(1)) * 24
-    m = re.search(r"(\d+)\s*д(?:ень|ня|ней|ен)?(?:\b|[^а-яё])", s)
+    m = re.search(r"(?<![+➕])(\d+)\s*д(?:ень|ня|ней|ен)?(?:\b|[^а-яё])", s)
     if m:
         return int(m.group(1)) * 24
     if re.search(r"\bсутки\b", s) and not re.search(r"\d+\s*сут", s):
         return 24
 
-    m = re.search(r"(\d+)\s*(?:час|часа|часов|ч\.?|h|hour|hours|hr)\b", s)
+    m = re.search(r"(?<![+➕])(\d+)\s*(?:час|часа|часов|ч\.?|h|hour|hours|hr)\b", s)
     if m:
         return int(m.group(1))
-    m = re.search(r"(\d+)\s*ч(?:ас(?:а|ов)?)?(?:\b|[^а-яё])", s)
+    m = re.search(r"(?<![+➕])(\d+)\s*ч(?:ас(?:а|ов)?)?(?:\b|[^а-яё])", s)
     if m:
         return int(m.group(1))
 

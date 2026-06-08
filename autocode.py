@@ -21,6 +21,7 @@ import uuid as uuid_lib
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
+import threading
 from threading import Thread, Timer, Lock
 
 from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent, OrderStatusChangedEvent
@@ -34,11 +35,11 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.2.4"
+VERSION = "5.5.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
-    "v5.2.4: фиксы race conditions, IMAP-утечки, snapshot-текст рассылки, защита от двойного завершения аренды.\n"
+    "v5.5.0: только RU, все тексты редактируемы в TG, команды для всех, подтверждение заказа, фикс IMAP.\n"
     "Управление: /autocode"
 )
 CREDITS = "@offsidezq"
@@ -97,6 +98,13 @@ AC_WB_RUN        = "ac_wb_run"
 AC_WB_TPL        = "ac_wb_tpl"
 AC_CHECK_ALL     = "ac_check_all"
 
+CODE_TYPE_RU = {
+    "alnum":      "буквы + цифры",
+    "digits":     "только цифры",
+    "alpha":      "только буквы",
+    "alnum-dash": "буквы + цифры + дефис",
+}
+
 # ── Storage paths ──
 DATA_DIR        = "storage/autocode"
 BACKUP_DIR      = os.path.join(DATA_DIR, "backups")
@@ -112,6 +120,7 @@ WINBACK_FILE    = os.path.join(DATA_DIR, "winback_sent.json")
 SETTINGS_FILE   = os.path.join(DATA_DIR, "settings.json")
 LANG_CACHE_FILE = os.path.join(DATA_DIR, "lang_cache.json")
 BONUS_LOG_FILE  = os.path.join(DATA_DIR, "bonus_hours_log.json")
+BONUS_PENDING_FILE = os.path.join(DATA_DIR, "bonus_pending.json")
 
 ENCRYPTED_FILES = {RENTALS_FILE, USED_FILE, ACCOUNTS_FILE}
 
@@ -133,7 +142,7 @@ IMAP_HOSTS = {
 IMAP_TIMEOUT          = 15
 CODE_CD               = 30
 MAX_CODES_HOUR        = 10
-WARN_BEFORE_H         = 4
+WARN_BEFORE_H         = 12
 PRE_WINDOW            = 2 * 3600
 USED_CODE_TTL_SEC     = 3 * 3600
 WEEKLY_REPORT_DOW     = 6
@@ -141,6 +150,7 @@ WEEKLY_REPORT_HOUR    = 9
 RENTAL_GRACE_SEC      = 300
 HEALTH_CHECK_INTERVAL = 3600
 REVIEW_DELAY_SEC      = 30 * 60
+ORDER_CONFIRM_DELAY   = 5 * 60   # 5 min after code → ask buyer to confirm order
 WINBACK_AFTER_DAYS    = 3
 WINBACK_MAX_DAYS      = 30
 RENTALS_PAGE_SIZE     = 8
@@ -151,22 +161,64 @@ COMMAND_MESSAGES = {
     "!cd", "cd", "code", "!code", "код", "!код",
     "!time", "time", "!время", "время",
     "!help", "help", "помощь", "!помощь",
+    "!продлить", "!extend", "продлить",
+    "!faq", "faq", "!команды", "команды",
 }
 
-_SECRET_KEY = (os.environ.get("AC_SECRET") or "ac_fp_secret_2025").encode()
+# ── Problem detection keywords (buyer messages → seller TG notification) ──
+_PROBLEM_KEYWORDS = (
+    "не работает", "не могу войти", "не заходит", "не получается",
+    "помогите", "проблема", "ошибка", "не подходит", "не тот",
+    "верните деньги", "возврат", "обман", "не приходит",
+    "doesn't work", "can't login", "can't log in", "not working",
+    "help me", "problem", "error", "wrong", "refund",
+)
+_PROBLEM_COOLDOWN: dict[str, float] = {}  # buyer -> last_notify_ts
+_PROBLEM_COOLDOWN_SEC = 600  # don't spam seller: 1 notification per buyer per 10 min
+
 _ENC_MARKER = "ACENC1:"
+_FERNET_MARKER = "ACFERNET:"
+
+# ── Crypto: Fernet (preferred) with XOR fallback for migration ──
+try:
+    from cryptography.fernet import Fernet as _Fernet, InvalidToken as _InvalidToken
+    _FERNET_KEY = os.environ.get("AC_FERNET_KEY", "")
+    if not _FERNET_KEY:
+        _key_file = os.path.join("storage", "autocode", ".fernet_key")
+        if os.path.exists(_key_file):
+            with open(_key_file, "r") as _f:
+                _FERNET_KEY = _f.read().strip()
+        else:
+            _FERNET_KEY = _Fernet.generate_key().decode()
+            os.makedirs(os.path.dirname(_key_file), exist_ok=True)
+            with open(_key_file, "w") as _f:
+                _f.write(_FERNET_KEY)
+            logger.info("AutoCode: сгенерирован новый Fernet-ключ в .fernet_key")
+    _cipher = _Fernet(_FERNET_KEY.encode() if isinstance(_FERNET_KEY, str) else _FERNET_KEY)
+    _HAS_FERNET = True
+except ImportError:
+    _HAS_FERNET = False
+    logger.warning("AutoCode: cryptography не установлена, используется XOR (небезопасно!). pip install cryptography")
+
+# XOR fallback for reading old data
+_SECRET_KEY = (os.environ.get("AC_SECRET") or "ac_fp_secret_2025").encode()
 
 def _xor_bytes(data: bytes) -> bytes:
     key = _SECRET_KEY
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
-def _xor_crypt(data: str) -> str:
-    return base64.b64encode(_xor_bytes(data.encode("utf-8"))).decode()
-
 def _encrypt_password(plain: str) -> str:
-    return _xor_crypt(plain)
+    if _HAS_FERNET:
+        return _FERNET_MARKER + _cipher.encrypt(plain.encode("utf-8")).decode()
+    return base64.b64encode(_xor_bytes(plain.encode("utf-8"))).decode()
 
 def _decrypt_password(enc: str) -> str:
+    if enc.startswith(_FERNET_MARKER) and _HAS_FERNET:
+        try:
+            return _cipher.decrypt(enc[len(_FERNET_MARKER):].encode()).decode("utf-8")
+        except Exception:
+            return enc
+    # XOR fallback for old passwords
     try:
         raw = base64.b64decode(enc.encode())
         return _xor_bytes(raw).decode("utf-8")
@@ -174,25 +226,44 @@ def _decrypt_password(enc: str) -> str:
         return enc
 
 def _encrypt_file_content(plain_json: str) -> str:
+    if _HAS_FERNET:
+        return _FERNET_MARKER + _cipher.encrypt(plain_json.encode("utf-8")).decode()
     encoded = base64.b64encode(_xor_bytes(plain_json.encode("utf-8"))).decode()
     return _ENC_MARKER + encoded
 
 def _decrypt_file_content(raw: str) -> str:
-    if not raw.startswith(_ENC_MARKER):
-        return raw
-    try:
-        encoded = raw[len(_ENC_MARKER):]
-        return _xor_bytes(base64.b64decode(encoded.encode())).decode("utf-8")
-    except Exception as e:
-        logger.error(f"AutoCode: ошибка расшифровки: {e}")
-        return raw
+    if raw.startswith(_FERNET_MARKER) and _HAS_FERNET:
+        try:
+            return _cipher.decrypt(raw[len(_FERNET_MARKER):].encode()).decode("utf-8")
+        except Exception as e:
+            logger.error(f"AutoCode: ошибка Fernet-расшифровки: {e}")
+            return raw
+    if raw.startswith(_ENC_MARKER):
+        try:
+            encoded = raw[len(_ENC_MARKER):]
+            return _xor_bytes(base64.b64decode(encoded.encode())).decode("utf-8")
+        except Exception as e:
+            logger.error(f"AutoCode: ошибка XOR-расшифровки: {e}")
+            return raw
+    return raw
 
 _cardinal_ref = None
-_shutdown_flag = {"stop": False}
+_shutdown_event = threading.Event()
+# Legacy compat wrapper
+_shutdown_flag = type("_ShutdownProxy", (), {
+    "__getitem__": lambda self, k: _shutdown_event.is_set(),
+    "__setitem__": lambda self, k, v: _shutdown_event.set() if v else None,
+    "get": lambda self, k, d=None: _shutdown_event.is_set(),
+})()
 
 def _ensure():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
+
+# ── Data-loss protection ──
+# Tracks files that failed to decrypt — prevents overwriting encrypted data
+# with an empty default.
+_decrypt_failed: set[str] = set()
 
 def _load(path, default):
     _ensure()
@@ -202,15 +273,56 @@ def _load(path, default):
         with open(path, encoding="utf-8") as f:
             raw = f.read()
         if path in ENCRYPTED_FILES:
-            raw = _decrypt_file_content(raw)
-        return json.loads(raw) if raw.strip() else default
+            decrypted = _decrypt_file_content(raw)
+            # If decryption returned the raw blob unchanged, it failed
+            if decrypted == raw and raw.startswith((_FERNET_MARKER, _ENC_MARKER)):
+                _decrypt_failed.add(path)
+                logger.critical(
+                    f"AutoCode: ❌ РАСШИФРОВКА ПРОВАЛЕНА для {path}! "
+                    f"Данные на диске защищены, запись заблокирована. "
+                    f"Проверьте .fernet_key!"
+                )
+                return default
+            raw = decrypted
+        result = json.loads(raw) if raw.strip() else default
+        _decrypt_failed.discard(path)
+        return result
     except Exception as e:
         logger.warning(f"AutoCode: не удалось прочитать {path}: {e}")
         return default
 
 def _save(path, data):
     _ensure()
+    # ── Guard: block saves if decryption previously failed ──
+    if path in _decrypt_failed:
+        logger.critical(
+            f"AutoCode: ❌ ЗАПИСЬ В {path} ЗАБЛОКИРОВАНА — расшифровка была "
+            f"неудачной, данные на диске сохранены. Восстановите .fernet_key "
+            f"и перезагрузите плагин."
+        )
+        return
     try:
+        # ── Guard: pre-save backup if data shrinks significantly ──
+        if path in ENCRYPTED_FILES and os.path.exists(path):
+            try:
+                file_size = os.path.getsize(path)
+                new_json = json.dumps(data, ensure_ascii=False)
+                # If the file on disk is 2x+ bigger than what we're about to
+                # write, make an emergency backup before overwriting.
+                if file_size > 500 and len(new_json) < file_size // 2:
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    name = os.path.basename(path).replace(
+                        ".json", f"_emergency_{stamp}.json"
+                    )
+                    import shutil
+                    shutil.copy2(path, os.path.join(BACKUP_DIR, name))
+                    logger.warning(
+                        f"AutoCode: ⚠️ Экстренный бекап {path} → {name} "
+                        f"(было {file_size}B, пишем {len(new_json)}B)"
+                    )
+            except Exception as be:
+                logger.warning(f"AutoCode: ошибка экстренного бекапа: {be}")
+
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
         if path in ENCRYPTED_FILES:
             json_str = _encrypt_file_content(json_str)
@@ -260,7 +372,7 @@ def templates():           return _load(TEMPLATES_FILE, [])
 def save_templates(d):     _save(TEMPLATES_FILE, d)
 def bcast_history():       return _load(BCAST_HIST_FILE, [])
 def save_bcast_history(d): _save(BCAST_HIST_FILE, d)
-def warned_state():        return _load(WARNED_FILE, {"warned_4h": [], "warned_30m": []})
+def warned_state():        return _load(WARNED_FILE, {"warned_12h": []})
 def save_warned(d):        _save(WARNED_FILE, d)
 def health_state():        return _load(HEALTH_FILE, {})
 def save_health(d):        _save(HEALTH_FILE, d)
@@ -274,11 +386,13 @@ def app_settings():        return _load(SETTINGS_FILE, {
     "winback_enabled":  True,
     "winback_template": "👋 Скучаем! Возвращайся — даём промокод RETURN25 на скидку 25% на следующую аренду. Просто напиши в чат, когда соберёшься заказывать.",
     "winback_discount": 25,
+    "confirm_enabled":  True,
     "queue_pause_sec":  2,
     "bonus_hours_enabled":  True,
     "bonus_hours_pattern": r"[+➕]\s*(\d+)\s*[Чч]",
-    "bonus_notify_text":  "🎁 Бонус +{hours}Ч за отзыв! Спасибо!",
     "bonus_fallback":     0,
+    "faq_custom_ru":      "",
+    "texts":              {},
 })
 def save_settings(d):      _save(SETTINGS_FILE, d)
 
@@ -312,6 +426,26 @@ def _bonus_mark_processed(order_id):
             log.setdefault("processed_orders", []).append(str(order_id))
             _bonus_save_log(log)
 
+def _bonus_pending() -> dict:
+    return _load(BONUS_PENDING_FILE, {})
+
+def _bonus_save_pending(d: dict):
+    _save(BONUS_PENDING_FILE, d)
+
+def _bonus_add_pending(order_id: str, order_data: dict):
+    with BONUS_LOG_LOCK:
+        p = _bonus_pending()
+        if order_id not in p:
+            p[order_id] = order_data
+            _bonus_save_pending(p)
+
+def _bonus_remove_pending(order_id: str):
+    with BONUS_LOG_LOCK:
+        p = _bonus_pending()
+        if order_id in p:
+            del p[order_id]
+            _bonus_save_pending(p)
+
 def _bonus_extract_hours(short_desc: str, pattern: str = None) -> int | None:
     if not short_desc:
         return None
@@ -329,7 +463,7 @@ def _bonus_add_hours_to_rental(order_id, hours: int):
             rents[key]["hours"] = rents[key].get("hours", 0) + hours
             save_rentals(rents)
             state = warned_state()
-            for s_key in ("warned_4h", "warned_30m"):
+            for s_key in ("warned_12h",):
                 if key in state.get(s_key, []):
                     state[s_key].remove(key)
             save_warned(state)
@@ -338,6 +472,60 @@ def _bonus_add_hours_to_rental(order_id, hours: int):
     logger.warning(f"AutoCode bonus: аренда для заказа {order_id} не найдена")
     return False
 
+_COMPLETED_STATUSES = {"completed", "closed", "done", "выполнен", "закрыт", "завершён"}
+
+def _order_get_review(order):
+    """Extract review from order object. Returns (stars: int|None, has_review: bool)."""
+    # FunPayAPI Review object: order.review with .stars and .text
+    review = getattr(order, "review", None)
+    if review is not None:
+        stars = getattr(review, "stars", None) or getattr(review, "rating", None)
+        return stars, True
+    # Fallback: maybe direct .stars or .rating
+    stars = getattr(order, "stars", None) or getattr(order, "rating", None)
+    if stars is not None:
+        return stars, True
+    # Fallback: boolean flag
+    if getattr(order, "has_review", False):
+        return None, True
+    return None, False
+
+def _order_get_desc(order) -> str | None:
+    """Extract lot description/title for hours parsing."""
+    lot = getattr(order, "lot", None)
+    if lot is not None:
+        desc = (getattr(lot, "short_description", None)
+                or getattr(lot, "shortdesc", None)
+                or getattr(lot, "description", None))
+        if desc:
+            return desc
+    for attr in ("short_description", "item_title", "lot_name", "description"):
+        val = getattr(order, attr, None)
+        if val:
+            return val
+    return None
+
+def _bonus_apply(c, order_id: str, short_desc: str | None,
+                 chat_id=None, chat_name: str = ""):
+    """Apply bonus hours for a reviewed order. Returns True if applied."""
+    settings = app_settings()
+    pattern = settings.get("bonus_hours_pattern", r"[+➕]\s*(\d+)\s*[Чч]")
+    hours = _bonus_extract_hours(short_desc, pattern) if short_desc else None
+    if hours is None:
+        hours = settings.get("bonus_fallback", 0)
+        if hours <= 0:
+            return False
+    applied = _bonus_add_hours_to_rental(order_id, hours)
+    _bonus_mark_processed(order_id)
+    _bonus_remove_pending(order_id)
+    if chat_id and c is not None:
+        notify_text = t("bonus_notify", hours=hours)
+        if not applied:
+            notify_text += "\n(часы будут начислены вручную)"
+        Thread(target=c.send_message, args=(chat_id, notify_text, chat_name), daemon=True).start()
+    logger.info(f"AutoCode bonus applied: order={order_id}, hours={hours}, rental_found={applied}")
+    return True
+
 def _bonus_on_order_status_changed(c: Cardinal, e):
     settings = app_settings()
     if not settings.get("bonus_hours_enabled", True):
@@ -345,47 +533,59 @@ def _bonus_on_order_status_changed(c: Cardinal, e):
     order = getattr(e, "order", None)
     if order is None:
         return
-    status = getattr(order, "status", "") or ""
-    if status.lower() not in ("completed", "выполнен", "done"):
+    status = str(getattr(order, "status", "") or "").lower()
+    if status not in _COMPLETED_STATUSES:
         return
     order_id = str(getattr(order, "id", ""))
     if not order_id:
         return
     if _bonus_is_processed(order_id):
         return
-    review_rating = getattr(order, "rating", None)
-    if review_rating is None:
-        review = getattr(order, "review", None)
-        if review is None:
-            has_review = getattr(order, "has_review", False)
-            if not has_review:
-                return
-    if review_rating is not None and review_rating < 4:
-        return
-    short_desc = None
-    lot = getattr(order, "lot", None)
-    if lot is not None:
-        short_desc = (getattr(lot, "short_description", None) or getattr(lot, "shortdesc", None) or getattr(lot, "description", None))
-    if short_desc is None and hasattr(order, "item_title"):
-        short_desc = order.item_title
-    if short_desc is None and hasattr(order, "lot_name"):
-        short_desc = order.lot_name
-    pattern = settings.get("bonus_hours_pattern", r"[+➕]\s*(\d+)\s*[Чч]")
-    hours = _bonus_extract_hours(short_desc, pattern) if short_desc else None
-    if hours is None:
-        hours = settings.get("bonus_fallback", 0)
-        if hours <= 0:
-            return
-    applied = _bonus_add_hours_to_rental(order_id, hours)
-    _bonus_mark_processed(order_id)
+
+    stars, has_review = _order_get_review(order)
+    short_desc = _order_get_desc(order)
     chat_id = getattr(order, "chat_id", None)
     chat_name = getattr(order, "chat_name", "") or ""
-    if chat_id:
-        notify_text = settings.get("bonus_notify_text", "🎁 Бонус +{hours}Ч за отзыв! Спасибо!")
-        notify_text = notify_text.replace("{hours}", str(hours))
-        if not applied:
-            notify_text += "\n(часы будут начислены вручную)"
-        Thread(target=c.send_message, args=(chat_id, notify_text, chat_name), daemon=True).start()
+
+    if has_review:
+        # Review exists — check rating
+        if stars is not None and stars < 4:
+            logger.info(f"AutoCode bonus skipped: order={order_id}, stars={stars}")
+            _bonus_mark_processed(order_id)
+            return
+        _bonus_apply(c, order_id, short_desc, chat_id, chat_name)
+    else:
+        # No review yet — save to pending for deferred check
+        _bonus_add_pending(order_id, {
+            "short_desc": short_desc,
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "saved_at": time.time(),
+        })
+        logger.info(f"AutoCode bonus pending: order={order_id} (no review yet)")
+        # Schedule a re-check after 2 hours
+        def _deferred_check():
+            if _shutdown_flag["stop"] or _bonus_is_processed(order_id):
+                return
+            pending = _bonus_pending()
+            if order_id not in pending:
+                return
+            # Still no event-based review → check if rental is still active
+            rents = rentals()
+            for k, r in rents.items():
+                if r.get("order_id") == order_id or r.get("order_key") == order_id:
+                    if _safe_ts(r.get("expires_at", 0)) > time.time():
+                        # Rental still active — keep pending
+                        logger.debug(f"AutoCode bonus deferred: order={order_id} still active, re-queued")
+                        return
+            # Rental expired or not found — give bonus anyway (buyer probably left review
+            # and we missed the event, or review came via web)
+            logger.info(f"AutoCode bonus deferred apply: order={order_id}")
+            _bonus_apply(c, order_id, short_desc, chat_id, chat_name)
+
+        t_timer = Timer(2 * 3600, _deferred_check)
+        t_timer.daemon = True
+        t_timer.start()
 
 _lang_cache_mem: dict[str, str] = {}
 _lang_cache_lock = Lock()
@@ -456,10 +656,16 @@ def detect_lang(text: str) -> str | None:
         return "ru"
     return "en"
 
+_INVISIBLE_RE = re.compile(r'[\u200b\u200c\u200d\u200e\u200f\u00a0\ufeff\u2060\u2061\u2062\u2063\u2064\u2066\u2067\u2068\u2069\u202a\u202b\u202c\u202d\u202e]')
+
+def _strip_invisible(text: str) -> str:
+    """Remove zero-width and invisible Unicode characters."""
+    return _INVISIBLE_RE.sub('', text).strip()
+
 def _is_command_message(text: str) -> bool:
     if not text:
         return False
-    return text.strip().lower() in COMMAND_MESSAGES
+    return _strip_invisible(text).lower() in COMMAND_MESSAGES
 
 def get_buyer_lang(buyer: str, current_text: str = "") -> str:
     with _lang_cache_lock:
@@ -484,44 +690,59 @@ def get_buyer_lang(buyer: str, current_text: str = "") -> str:
 
     return "ru"
 
-L = {
-    "ru": {
-        "rental_activated":   "🌸 | Аренда активирована, напиши команду в чат: !cd или code",
-        "rental_renewed":     "✅ Аренда продлена на {h}ч!\nНовое время окончания: {t}",
-        "code_msg":           "🔑 Ваш код: {code}\n📅 Получен: {dt}",
-        "no_rental":          "❌ У вас нет активной аренды. Пожалуйста, оформите заказ.",
-        "no_active":          "❌ У вас нет активной аренды.",
-        "remaining":          "⏳ Осталось: {rem}\n📅 Окончание: {end}",
-        "code_not_found":     "❌ Код не найден. Попробуйте через минуту или обратитесь к продавцу.",
-        "rate_wait":          "⏳ Подождите {s} сек. перед повторным запросом.",
-        "rate_hour_limit":    "❌ Превышен лимит ({n} запросов/час). Обратитесь к продавцу.",
-        "mailbox_missing":    "⚠️ Почтовый аккаунт не настроен. Обратитесь к продавцу.",
-        "warn_4h":            "⏰ До окончания аренды осталось {h} часа. Хотите продлить? Просто сделайте новый заказ 😊",
-        "warn_30m":           "⏰ До окончания аренды осталось 30 минут!",
-        "rental_ended":       "✅ Ваша аренда завершена, спасибо за покупку! Хотите продлить? Просто сделайте новый заказ 😊",
-        "queue_position":     "⏳ Ваш запрос в очереди (позиция {pos}). Подождите немного...",
-    },
-    "en": {
-        "rental_activated":   "🌸 | Rental activated! Send !cd or code in this chat to receive your code.",
-        "rental_renewed":     "✅ Rental extended by {h}h!\nNew expiry: {t}",
-        "code_msg":           "🔑 Your code: {code}\n📅 Received: {dt}",
-        "no_rental":          "❌ You have no active rental. Please place an order first.",
-        "no_active":          "❌ You have no active rental.",
-        "remaining":          "⏳ Time left: {rem}\n📅 Expires: {end}",
-        "code_not_found":     "❌ Code not found. Please try again in a minute or contact the seller.",
-        "rate_wait":          "⏳ Please wait {s} sec before the next request.",
-        "rate_hour_limit":    "❌ Hourly limit exceeded ({n}/hour). Contact the seller.",
-        "mailbox_missing":    "⚠️ Mailbox is not configured. Please contact the seller.",
-        "warn_4h":            "⏰ {h} hours left on your rental. Want to extend? Just place a new order 😊",
-        "warn_30m":           "⏰ Only 30 minutes left on your rental!",
-        "rental_ended":       "✅ Your rental has ended. Thank you for your purchase! Want to extend? Just place a new order 😊",
-        "queue_position":     "⏳ Your request is queued (position {pos}). Hang tight...",
-    },
+L_DEFAULTS = {
+    "rental_activated":   "🌸 | Аренда активирована, команды для входа можешь узнать по команде !faq",
+    "rental_renewed":     "✅ Аренда продлена на {h}ч!\nНовое время окончания: {t}",
+    "code_msg":           "🔑 Ваш код: {code}\n📅 Получен: {dt}",
+    "no_rental":          "❌ У вас нет активной аренды. Пожалуйста, оформите заказ.",
+    "no_active":          "❌ У вас нет активной аренды.",
+    "remaining":          "⏳ Осталось: {rem}\n📅 Окончание: {end}",
+    "code_not_found":     "❌ Код не найден. Попробуйте через минуту или обратитесь к продавцу.",
+    "rate_wait":          "⏳ Подождите {s} сек. перед повторным запросом.",
+    "rate_hour_limit":    "❌ Превышен лимит ({n} запросов/час). Обратитесь к продавцу.",
+    "mailbox_missing":    "⚠️ Почтовый аккаунт не настроен. Обратитесь к продавцу.",
+    "warn_12h":           "⏰ До окончания аренды осталось {h} часов. Хотите продлить? Просто сделайте новый заказ 😊",
+    "rental_ended":       "✅ Ваша аренда завершена, спасибо за покупку! Хотите продлить? Просто сделайте новый заказ 😊",
+    "queue_position":     "⏳ Ваш запрос в очереди (позиция {pos}). Подождите немного...",
+    "faq":                "📋 Доступные команды:\n\n"
+                          "• !cd / code / код — получить код\n"
+                          "• !time / время — сколько осталось аренды\n"
+                          "• !продлить — ссылка для продления\n"
+                          "• !faq / команды — эта справка\n\n"
+                          "{custom}",
+    "extend_link":        "🔄 Для продления оформите новый заказ по ссылке:\nhttps://funpay.com/lots/offer?id={lot_id}",
+    "extend_no_rental":   "❌ У вас нет активной аренды для продления.",
+    "order_confirm":      "✅ Если всё работает — пожалуйста, подтвердите заказ:\nhttps://funpay.com/orders/{order_id}/",
+    "bonus_notify":       "🎁 Бонус +{hours}Ч за отзыв! Спасибо!",
 }
 
-def t(lang: str, key: str, **kwargs) -> str:
-    bundle = L.get(lang, L["ru"])
-    text = bundle.get(key, L["ru"].get(key, key))
+# Editable text keys shown in TG settings (display_name → L_DEFAULTS key)
+_EDITABLE_TEXTS = {
+    "Активация аренды":      "rental_activated",
+    "Продление аренды":      "rental_renewed",
+    "Выдача кода":           "code_msg",
+    "Нет аренды":            "no_rental",
+    "Нет активной аренды":   "no_active",
+    "Остаток времени":       "remaining",
+    "Код не найден":         "code_not_found",
+    "Подождите (КД)":        "rate_wait",
+    "Лимит запросов":        "rate_hour_limit",
+    "Почта не настроена":    "mailbox_missing",
+    "Предупр. 12ч":          "warn_12h",
+    "Аренда завершена":      "rental_ended",
+    "Очередь":               "queue_position",
+    "FAQ":                   "faq",
+    "Ссылка продления":      "extend_link",
+    "Нет аренды (продл.)":   "extend_no_rental",
+    "Подтвержд. заказа":     "order_confirm",
+    "Бонус за отзыв":        "bonus_notify",
+}
+
+def t(key: str, **kwargs) -> str:
+    """Get message text: first check settings overrides, then L_DEFAULTS."""
+    s = app_settings()
+    overrides = s.get("texts", {})
+    text = overrides.get(key) or L_DEFAULTS.get(key, key)
     if kwargs:
         try:
             return text.format(**kwargs)
@@ -577,28 +798,50 @@ def _find_code(plain, html, subj, acc) -> str | None:
         char_cls = f"(?:{char_cls}| )"
 
     if code_len:
-        pat = re.compile(rf"\b{char_cls}{{{max(1, code_len - 2)},{code_len + 10}}}\b")
+        # STRICT: exact length match — if code_len=4 only match exactly 4 chars
+        pat = re.compile(rf"(?<!\w){char_cls}{{{code_len}}}(?!\w)")
     else:
-        pat = re.compile(rf"{char_cls}{{4,64}}")
+        # Auto: at least 4 chars, require digit for alnum types
+        if code_type in ("alnum", "alnum-dash"):
+            pat = re.compile(rf"(?=.*\d){char_cls}{{4,64}}")
+        elif code_type == "digits":
+            pat = re.compile(rf"\d{{4,64}}")
+        else:
+            pat = re.compile(rf"{char_cls}{{4,64}}")
 
     text = plain or _html_to_text(html)
 
+    # Validate match — for strict code_len, ensure it's actually the right length
+    def _validate(match_str: str) -> bool:
+        clean = match_str.strip()
+        if code_len and len(clean) != code_len:
+            return False
+        if code_type == "digits" and not clean.isdigit():
+            return False
+        return True
+
+    # 1. Check each line as a standalone code
     for line in text.splitlines():
         line = line.strip()
-        if pat.fullmatch(line):
-            return line
+        m = pat.fullmatch(line)
+        if m and _validate(m.group()):
+            return m.group()
 
-    keywords = ["код", "code", "ключ", "key", "enter", "активац"]
+    # 2. Search near code-related keywords
+    keywords = ["код", "code", "ключ", "key", "enter", "активац", "verification", "pin"]
     for kw in keywords:
         idx = text.lower().find(kw)
         if idx != -1:
-            snippet = text[idx:idx + 120]
+            snippet = text[max(0, idx - 20):idx + 120]
             m = pat.search(snippet)
-            if m:
+            if m and _validate(m.group()):
                 return m.group()
 
-    m = pat.search(text)
-    return m.group() if m else None
+    # 3. Global search
+    for m in pat.finditer(text):
+        if _validate(m.group()):
+            return m.group()
+    return None
 
 def fetch_code(acc, used, not_before_ts=None, dry_run=False) -> tuple[str | None, str | None]:
     email_addr  = acc.get("email", "")
@@ -620,7 +863,10 @@ def fetch_code(acc, used, not_before_ts=None, dry_run=False) -> tuple[str | None
     try:
         mail = imaplib.IMAP4_SSL(imap_host, timeout=IMAP_TIMEOUT)
         mail.login(email_addr, password)
-        mail.select("INBOX")
+        # FIX: Explicit error handling for INBOX select
+        status, _ = mail.select("INBOX")
+        if status != "OK":
+            return None, f"INBOX недоступен: статус {status}"
 
         if filter_from:
             _, data = mail.search(None, "FROM", filter_from)
@@ -783,19 +1029,25 @@ _code_requests: dict[str, list[float]] = {}
 _last_code_ts:  dict[str, float]       = {}
 _rate_lock = Lock()
 _winback_lock = Lock()
+_used_lock = Lock()
+_rentals_lock = Lock()
 
-def _check_rate(buyer: str, lang: str = "ru") -> tuple[bool, str]:
+def _check_rate(buyer: str) -> tuple[bool, str]:
     with _rate_lock:
         now = time.time()
         last = _last_code_ts.get(buyer, 0)
         if now - last < CODE_CD:
             wait = int(CODE_CD - (now - last))
-            return False, t(lang, "rate_wait", s=wait)
+            return False, t("rate_wait", s=wait)
         hour_ago = now - 3600
         reqs = [x for x in _code_requests.get(buyer, []) if x > hour_ago]
-        _code_requests[buyer] = reqs
+        # FIX: Clean up stale buyer entries to prevent memory leak
+        if not reqs:
+            _code_requests.pop(buyer, None)
+        else:
+            _code_requests[buyer] = reqs
         if len(reqs) >= MAX_CODES_HOUR:
-            return False, t(lang, "rate_hour_limit", n=MAX_CODES_HOUR)
+            return False, t("rate_hour_limit", n=MAX_CODES_HOUR)
         return True, ""
 
 def _record_request(buyer: str):
@@ -812,9 +1064,9 @@ def kb_main():
          B("📜 Лог выдач",       callback_data=AC_LOG)],
         [B("📊 Статистика",      callback_data=AC_STATS),
          B("📢 Рассылка",        callback_data=AC_BROADCAST)],
-        [B("🩺 Health check",    callback_data=AC_HEALTH),
+        [B("🩺 Проверка почт",   callback_data=AC_HEALTH),
          B("⚙️ Настройки",       callback_data=AC_REVIEW)],
-        [B("🔄 Win-back",        callback_data=AC_WINBACK)],
+        [B("🔄 Возврат клиентов", callback_data=AC_WINBACK)],
     ])
 
 def kb_stats_period():
@@ -1043,6 +1295,10 @@ def _startup_sales_scan(cardinal):
     time.sleep(10)
     try:
         acc_obj = cardinal.account
+        # FIX: Check that get_sales exists before calling
+        if not hasattr(acc_obj, 'get_sales'):
+            logger.warning("AutoCode: get_sales недоступен в текущей версии Cardinal")
+            return
         now     = time.time()
         cutoff  = now - 30 * 24 * 3600
 
@@ -1238,8 +1494,7 @@ def _startup_sales_scan(cardinal):
                 f"Проверено: {len(all_shortcuts)} заказов.\n"
                 f"Без часов: {skip_no_hours}\n"
                 f"Без аккаунта: {skip_no_acc}\n"
-                f"Уже истёк: {skip_expired}\n\n"
-                f"Скинь 2-3 названия лотов — допишу парсер."
+                f"Уже истёк: {skip_expired}"
             )
 
     except Exception as e:
@@ -1301,13 +1556,11 @@ def _weekly_report_worker(cardinal):
 def _expiry_watcher(cardinal):
     startup_ts = time.time()
     state = warned_state()
-    warned_4h = set(state.get("warned_4h", []))
-    warned_30m = set(state.get("warned_30m", []))
+    warned_12h = set(state.get("warned_12h", []))
 
     def _persist_state():
         save_warned({
-            "warned_4h":  list(warned_4h),
-            "warned_30m": list(warned_30m),
+            "warned_12h": list(warned_12h),
         })
 
     while not _shutdown_flag["stop"]:
@@ -1320,11 +1573,10 @@ def _expiry_watcher(cardinal):
             changed = False
             state_dirty = False
 
-            for s in (warned_4h, warned_30m):
-                stale = [k for k in s if k not in rents]
-                for k in stale:
-                    s.discard(k)
-                    state_dirty = True
+            stale = [k for k in warned_12h if k not in rents]
+            for k in stale:
+                warned_12h.discard(k)
+                state_dirty = True
 
             for key, r in list(rents.items()):
                 exp         = _safe_ts(r.get("expires_at", 0))
@@ -1344,46 +1596,35 @@ def _expiry_watcher(cardinal):
                 if not cid:
                     if now >= exp + 60:
                         del rents[key]
-                        warned_4h.discard(key)
-                        warned_30m.discard(key)
+                        warned_12h.discard(key)
                         changed = True
                         state_dirty = True
                         logger.info(f"AutoCode: аренда {key} ({r.get('buyer')}) завершена (без chat_id).")
                     continue
 
-                four_h = WARN_BEFORE_H * 3600
-                if (key not in warned_4h
-                        and (four_h - 600) <= left <= four_h):
-                    warned_4h.add(key)
+                warn_sec = WARN_BEFORE_H * 3600
+                if (key not in warned_12h
+                        and (warn_sec - 600) <= left <= warn_sec):
+                    warned_12h.add(key)
                     state_dirty = True
                     Thread(
                         target=cardinal.send_message,
-                        args=(cid, t(lang, "warn_4h", h=WARN_BEFORE_H), cname),
-                        daemon=True,
-                    ).start()
-
-                if (key not in warned_30m
-                        and 1500 <= left <= 1800):
-                    warned_30m.add(key)
-                    state_dirty = True
-                    Thread(
-                        target=cardinal.send_message,
-                        args=(cid, t(lang, "warn_30m"), cname),
+                        args=(cid, t("warn_12h", h=WARN_BEFORE_H), cname),
                         daemon=True,
                     ).start()
 
                 if now >= exp + 60:
-                    # Сначала удаляем и сохраняем — чтобы краш до отправки не дал двойного "ended"
-                    del rents[key]
-                    warned_4h.discard(key)
-                    warned_30m.discard(key)
-                    changed = True
-                    state_dirty = True
-                    save_rentals(rents)
+                    # FIX: Lock rental deletion to prevent race with on_new_order
+                    with _rentals_lock:
+                        del rents[key]
+                        warned_12h.discard(key)
+                        changed = True
+                        state_dirty = True
+                        save_rentals(rents)
                     _persist_state()
                     Thread(
                         target=cardinal.send_message,
-                        args=(cid, t(lang, "rental_ended"), cname),
+                        args=(cid, t("rental_ended"), cname),
                         daemon=True,
                     ).start()
 
@@ -1436,8 +1677,8 @@ def _winback_worker(cardinal):
                         if not cid:
                             continue
 
-                        text = settings.get("winback_template", "")
-                        ok, _ = _send_with_retry(cardinal, cid, text, buyer)
+                        tpl = settings.get("winback_template", "")
+                        ok, _ = _send_with_retry(cardinal, cid, tpl, buyer)
                         if ok:
                             sent_log[buyer] = {
                                 "sent_at": now,
@@ -1451,7 +1692,7 @@ def _winback_worker(cardinal):
                     if new_sends:
                         save_winback(sent_log)
                         _notify_tg(cardinal,
-                            f"🔄 AutoCode Win-back: отправлено {new_sends} сообщений неактивным покупателям.")
+                            f"🔄 Возврат клиентов: отправлено {new_sends} сообщений.")
 
         except Exception as e:
             logger.error(f"Winback worker error: {e}")
@@ -1461,7 +1702,7 @@ def _winback_worker(cardinal):
                 return
             time.sleep(1)
 
-def _schedule_review_request(cardinal, chat_id, chat_name, buyer, lang):
+def _schedule_review_request(cardinal, chat_id, chat_name, buyer):
     def _send():
         if _shutdown_flag["stop"]:
             return
@@ -1469,19 +1710,42 @@ def _schedule_review_request(cardinal, chat_id, chat_name, buyer, lang):
             settings = app_settings()
             if not settings.get("review_enabled", True):
                 return
-            still_active = any(
-                r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > time.time()
-                for r in rentals().values()
+            has_rental = any(
+                r.get("buyer") == buyer for r in rentals().values()
             )
-            if not still_active:
+            if not has_rental:
                 return
-            text = settings.get("review_template", "")
-            cardinal.send_message(chat_id, text, chat_name)
+            tpl = settings.get("review_template", "")
+            if not tpl:
+                return
+            cardinal.send_message(chat_id, tpl, chat_name)
             logger.info(f"AutoCode review request sent: {buyer}")
         except Exception as e:
             logger.warning(f"Review request fail {buyer}: {e}")
 
     t_timer = Timer(REVIEW_DELAY_SEC, _send)
+    t_timer.daemon = True
+    t_timer.start()
+
+
+def _schedule_order_confirm(cardinal, chat_id, chat_name, order_id):
+    """Send order confirmation request 5 min after code delivery."""
+    if not order_id:
+        return
+    def _send():
+        if _shutdown_flag["stop"]:
+            return
+        try:
+            settings = app_settings()
+            if not settings.get("confirm_enabled", True):
+                return
+            msg = t("order_confirm", order_id=order_id)
+            cardinal.send_message(chat_id, msg, chat_name)
+            logger.info(f"AutoCode order confirm sent: {order_id}")
+        except Exception as e:
+            logger.warning(f"Order confirm fail {order_id}: {e}")
+
+    t_timer = Timer(ORDER_CONFIRM_DELAY, _send)
     t_timer.daemon = True
     t_timer.start()
 
@@ -1494,7 +1758,8 @@ def _backup_worker():
         try:
             _ensure()
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
-            for src in (RENTALS_FILE, LOG_FILE):
+            # FIX: Also backup ACCOUNTS_FILE (credentials)
+            for src in (RENTALS_FILE, LOG_FILE, ACCOUNTS_FILE):
                 if os.path.exists(src):
                     name = os.path.basename(src).replace(".json", f"_{stamp}.json")
                     dst = os.path.join(BACKUP_DIR, name)
@@ -1527,7 +1792,8 @@ def _parse_hours(text: str) -> int | None:
     if re.search(r"\bмесяц\b", s) and not re.search(r"\d+\s*месяц", s):
         return 24 * 30
 
-    m = re.search(r"(?<![+➕])(\d+)\s*(?:неделя|недели|недель|нед\.?|week|weeks)\b", s)
+    # FIX: Split multi-byte ➕ into separate lookbehind for Python compat
+    m = re.search(r"(?<!\+)(?<!➕)(\d+)\s*(?:неделя|недели|недель|нед\.?|week|weeks)\b", s)
     if m:
         return int(m.group(1)) * 24 * 7
     if re.search(r"\bнеделя\b", s) and not re.search(r"\d+\s*недел", s):
@@ -1536,25 +1802,25 @@ def _parse_hours(text: str) -> int | None:
     m = re.search(r"(\d+)\s*(?:день|дня|дней|сутки|суток|д\.?|d|day|days)\b", s)
     if m:
         return int(m.group(1)) * 24
-    m = re.search(r"(?<![+➕])(\d+)\s*д(?:ень|ня|ней|ен)?(?:\b|[^а-яё])", s)
+    m = re.search(r"(?<!\+)(?<!➕)(\d+)\s*д(?:ень|ня|ней|ен)?(?:\b|[^а-яё])", s)
     if m:
         return int(m.group(1)) * 24
     if re.search(r"\bсутки\b", s) and not re.search(r"\d+\s*сут", s):
         return 24
 
-    m = re.search(r"(?<![+➕])(\d+)\s*(?:час|часа|часов|ч\.?|h|hour|hours|hr)\b", s)
+    m = re.search(r"(?<!\+)(?<!➕)(\d+)\s*(?:час|часа|часов|ч\.?|h|hour|hours|hr)\b", s)
     if m:
         return int(m.group(1))
-    m = re.search(r"(?<![+➕])(\d+)\s*ч(?:ас(?:а|ов)?)?(?:\b|[^а-яё])", s)
+    m = re.search(r"(?<!\+)(?<!➕)(\d+)\s*ч(?:ас(?:а|ов)?)?(?:\b|[^а-яё])", s)
     if m:
         return int(m.group(1))
 
     return None
 
 def _graceful_shutdown(*args):
-    if _shutdown_flag["stop"]:
+    if _shutdown_event.is_set():
         return
-    _shutdown_flag["stop"] = True
+    _shutdown_event.set()
     logger.info("AutoCode: graceful shutdown.")
 
 atexit.register(_graceful_shutdown)
@@ -1596,15 +1862,19 @@ def on_new_order(c, e: NewOrderEvent):
     now   = time.time()
     rents = rentals()
 
+    # FIX: Match by lot_id first, then fallback to buyer-only match
     for k, r in rents.items():
-        if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > now:
-            rents[k]["expires_at"] = _safe_ts(rents[k].get("expires_at", 0)) + hours * 3600
-            rents[k]["hours"]      = rents[k].get("hours", 0) + hours
-            cur_lang = get_buyer_lang(buyer, desc + " " + lot_name) or lang
-            rents[k]["lang"] = cur_lang
-            save_rentals(rents)
+        if r.get("buyer") == buyer \
+           and r.get("lot_id") == lot_id \
+           and _safe_ts(r.get("expires_at", 0)) > now:
+            with _rentals_lock:
+                rents[k]["expires_at"] = _safe_ts(rents[k].get("expires_at", 0)) + hours * 3600
+                rents[k]["hours"]      = rents[k].get("hours", 0) + hours
+                cur_lang = get_buyer_lang(buyer, desc + " " + lot_name) or lang
+                rents[k]["lang"] = cur_lang
+                save_rentals(rents)
             state = warned_state()
-            for s_key in ("warned_4h", "warned_30m"):
+            for s_key in ("warned_12h",):
                 if k in state.get(s_key, []):
                     state[s_key].remove(k)
             save_warned(state)
@@ -1612,27 +1882,28 @@ def on_new_order(c, e: NewOrderEvent):
             Thread(
                 target=c.send_message,
                 args=(chat_id,
-                      t(cur_lang, "rental_renewed", h=hours, t=_fmt_time(rents[k]['expires_at'])),
+                      t("rental_renewed", h=hours, t=_fmt_time(rents[k]['expires_at'])),
                       chat_name),
                 daemon=True,
             ).start()
             return
 
     expires_at = now + hours * 3600
-    rents[order_id] = {
-        "order_key":   order_id,
-        "buyer":       buyer,
-        "chat_id":     chat_id,
-        "chat_name":   chat_name,
-        "email":       acc_email,
-        "lot_id":      lot_id,
-        "order_id":    order_id,
-        "purchase_ts": now,
-        "expires_at":  expires_at,
-        "hours":       hours,
-        "lang":        lang,
-    }
-    save_rentals(rents)
+    with _rentals_lock:
+        rents[order_id] = {
+            "order_key":   order_id,
+            "buyer":       buyer,
+            "chat_id":     chat_id,
+            "chat_name":   chat_name,
+            "email":       acc_email,
+            "lot_id":      lot_id,
+            "order_id":    order_id,
+            "purchase_ts": now,
+            "expires_at":  expires_at,
+            "hours":       hours,
+            "lang":        lang,
+        }
+        save_rentals(rents)
     logger.info(
         f"AutoCode: новая аренда {buyer} | {acc_email} | {hours}ч | "
         f"до {_fmt_time(expires_at)} | order={order_id} | lang={lang}"
@@ -1640,107 +1911,169 @@ def on_new_order(c, e: NewOrderEvent):
 
     Thread(
         target=c.send_message,
-        args=(chat_id, t(lang, "rental_activated"), chat_name),
+        args=(chat_id, t("rental_activated"), chat_name),
         daemon=True,
     ).start()
+
+    # Schedule order confirmation after first code delivery (5 min)
+    # (actual sending happens in _on_result inside on_new_message)
 
 def on_new_message(c, e: NewMessageEvent):
     global _cardinal_ref
     _cardinal_ref = c
 
-    if e.message.author_id == c.account.id:
-        return
-
-    text  = (e.message.text or "").strip()
+    text  = _strip_invisible((e.message.text or ""))
     lower = text.lower()
 
-    buyer     = e.message.author
-    chat_id   = e.message.chat_id
+    # Skip own (bot-sent) messages, but allow commands from the seller
+    if e.message.author_id == c.account.id:
+        if not _is_command_message(text):
+            return
+
+    author    = e.message.author       # whoever sent this message
+    chat_id   = e.message.chat_id      # the order chat
     chat_name = e.message.chat_name
 
-    if not _is_command_message(text):
-        detected = detect_lang(text)
-        if detected:
-            _set_buyer_lang(buyer, detected)
+    # ── Detect review via system/buyer message and apply pending bonus ──
+    msg_type = getattr(e.message, "type", None)
+    is_system = (msg_type == MessageTypes.NON_SYSTEM) is False if msg_type is not None else False
+    review_keywords = ("оставил отзыв", "left a review", "новый отзыв", "отзыв получен", "⭐")
+    if is_system or any(kw in lower for kw in review_keywords):
+        pending = _bonus_pending()
+        for oid, pdata in list(pending.items()):
+            if _bonus_is_processed(oid):
+                _bonus_remove_pending(oid)
+                continue
+            if pdata.get("chat_id") == chat_id:
+                logger.info(f"AutoCode bonus: review detected via message for order={oid}")
+                _bonus_apply(c, oid, pdata.get("short_desc"),
+                             pdata.get("chat_id"), pdata.get("chat_name", ""))
+                break
 
-    lang = get_buyer_lang(buyer, text)
-
+    # ── Find active rental for this chat (by chat_id, not by author) ──
     rents = rentals()
+    now = time.time()
+
+    def _find_active_rentals_for_chat():
+        """Find active rentals matching this chat_id (any participant)."""
+        return sorted(
+            [r for r in rents.values()
+             if r.get("chat_id") == chat_id
+             and _safe_ts(r.get("expires_at", 0)) > now],
+            key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
+            reverse=True,
+        )
+
+    # Update chat_id on rentals by buyer name if not set
     rents_changed = False
     for k, r in rents.items():
-        if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > time.time():
+        if r.get("buyer") == author and _safe_ts(r.get("expires_at", 0)) > now:
             if not r.get("chat_id"):
                 rents[k]["chat_id"]   = chat_id
                 rents[k]["chat_name"] = chat_name
-                rents_changed = True
-            if not r.get("lang") or r.get("lang") != lang:
-                rents[k]["lang"] = lang
                 rents_changed = True
     if rents_changed:
         save_rentals(rents)
 
     if lower in ("!time", "time", "!время", "время"):
-        now = time.time()
-        active = sorted(
-            [r for r in rents.values() if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > now],
-            key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
-            reverse=True,
-        )
+        active = _find_active_rentals_for_chat()
         if not active:
-            reply = t(lang, "no_active")
+            reply = t("no_active")
         else:
             r = active[0]
-            reply = t(lang, "remaining",
-                      rem=_fmt_remaining(r['expires_at']),
-                      end=_fmt_time(r['expires_at']))
+            reply = t("remaining",
+                         rem=_fmt_remaining(r['expires_at']),
+                         end=_fmt_time(r['expires_at']))
         Thread(target=c.send_message, args=(chat_id, reply, chat_name), daemon=True).start()
         return
+
+    # ── !продлить / !extend — send lot link for re-purchase ──
+    if lower in ("!продлить", "!extend", "продлить"):
+        active = _find_active_rentals_for_chat()
+        if not active:
+            reply = t("extend_no_rental")
+        else:
+            lot_id = active[0].get("lot_id", "")
+            reply = t("extend_link", lot_id=lot_id)
+        Thread(target=c.send_message, args=(chat_id, reply, chat_name), daemon=True).start()
+        return
+
+    # ── !faq / !команды — show available commands ──
+    if lower in ("!faq", "faq", "!команды", "команды"):
+        settings = app_settings()
+        custom = settings.get("faq_custom_ru", "")
+        reply = t("faq", custom=custom)
+        Thread(target=c.send_message, args=(chat_id, reply, chat_name), daemon=True).start()
+        return
+
+    # ── Problem detection → notify seller in TG ──
+    if not _is_command_message(text) and any(kw in lower for kw in _PROBLEM_KEYWORDS):
+        now_p = time.time()
+        last_notify = _PROBLEM_COOLDOWN.get(author, 0)
+        if now_p - last_notify > _PROBLEM_COOLDOWN_SEC:
+            _PROBLEM_COOLDOWN[author] = now_p
+            active_r = _find_active_rentals_for_chat()
+            oid_tag = ""
+            if active_r:
+                oid = active_r[0].get("order_id", "")
+                lot_info = active_r[0].get("lot_id", "—")
+                remain   = _fmt_remaining(active_r[0]["expires_at"])
+                if oid:
+                    oid_tag = f"\n🏷 Заказ: #{oid} (https://funpay.com/orders/{oid}/)"
+            else:
+                lot_info = "—"
+                remain   = "—"
+            alert = (
+                f"🚨 Проблема у покупателя!\n\n"
+                f"👤 Отправитель: {author}\n"
+                f"📦 Лот: {lot_info}\n"
+                f"⏳ Осталось: {remain}\n"
+                f"💬 Сообщение: {text[:200]}"
+                f"{oid_tag}"
+            )
+            Thread(target=_notify_tg, args=(c, alert), daemon=True).start()
 
     if lower not in ("!cd", "code", "код", "!код"):
         return
 
-    allowed, reason = _check_rate(buyer, lang)
+    allowed, reason = _check_rate(author)
     if not allowed:
         Thread(target=c.send_message, args=(chat_id, reason, chat_name), daemon=True).start()
-        reqs = _code_requests.get(buyer, [])
+        reqs = _code_requests.get(author, [])
         if len(reqs) >= MAX_CODES_HOUR:
-            Thread(target=_notify_tg_rate_limit, args=(c, buyer, len(reqs)), daemon=True).start()
+            Thread(target=_notify_tg_rate_limit, args=(c, author, len(reqs)), daemon=True).start()
         return
 
-    now = time.time()
-    active = sorted(
-        [r for r in rents.values() if r.get("buyer") == buyer and _safe_ts(r.get("expires_at", 0)) > now],
-        key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
-        reverse=True,
-    )
+    active = _find_active_rentals_for_chat()
 
     if not active:
         Thread(
             target=c.send_message,
-            args=(chat_id, t(lang, "no_rental"), chat_name),
+            args=(chat_id, t("no_rental"), chat_name),
             daemon=True,
         ).start()
         return
 
     rental    = active[0]
     acc_email = rental.get("email")
+    order_id  = rental.get("order_id", "")
     accs      = accounts()
     acc       = next((a for a in accs if a["email"] == acc_email), None)
     if not acc:
         Thread(
             target=c.send_message,
-            args=(chat_id, t(lang, "mailbox_missing"), chat_name),
+            args=(chat_id, t("mailbox_missing"), chat_name),
             daemon=True,
         ).start()
         return
 
-    _record_request(buyer)
+    _record_request(author)
 
     q_size = _imap_queue.queue_size(acc_email)
     if q_size > 0:
         Thread(
             target=c.send_message,
-            args=(chat_id, t(lang, "queue_position", pos=q_size + 1), chat_name),
+            args=(chat_id, t("queue_position", pos=q_size + 1), chat_name),
             daemon=True,
         ).start()
 
@@ -1750,27 +2083,49 @@ def on_new_message(c, e: NewMessageEvent):
     def _on_result(result):
         code_val, err = result
         if not code_val:
-            reason_str = err or "Код не найден."
-            Thread(target=_notify_tg_code_not_found, args=(c, buyer, acc_email, reason_str), daemon=True).start()
+            # Don't notify seller in TG — just tell buyer
             Thread(
                 target=c.send_message,
-                args=(chat_id, t(lang, "code_not_found"), chat_name),
+                args=(chat_id, t("code_not_found"), chat_name),
                 daemon=True,
             ).start()
             return
 
-        u = used_codes()
-        u.setdefault(acc_email, []).append({"code": code_val, "used_at": time.time()})
-        save_used(u)
-        add_log(acc_email, rental.get("lot_id", "—"), buyer, code_val, chat_id)
+        # FIX: Lock used_codes read-modify-write to prevent race condition / double delivery
+        with _used_lock:
+            u = used_codes()
+            u.setdefault(acc_email, []).append({"code": code_val, "used_at": time.time()})
+            save_used(u)
+        buyer_name = rental.get("buyer", author)
+        add_log(acc_email, rental.get("lot_id", "—"), buyer_name, code_val, chat_id)
 
         received_dt = datetime.now().strftime("%d.%m.%Y %H:%M")
-        msg = t(lang, "code_msg", code=code_val, dt=received_dt)
+        msg = t("code_msg", code=code_val, dt=received_dt)
         Thread(target=c.send_message, args=(chat_id, msg, chat_name), daemon=True).start()
 
-        _schedule_review_request(c, chat_id, chat_name, buyer, lang)
+        _schedule_review_request(c, chat_id, chat_name, buyer_name)
+
+        # Schedule order confirmation after 5 min
+        _schedule_order_confirm(c, chat_id, chat_name, order_id)
 
     _imap_queue.submit(acc_email, fetch_code, _on_result, acc, used, not_before_ts=not_before_ts)
+
+def _bonus_process_stale_pending(c):
+    """Process any pending bonuses older than 3 hours (review probably left outside of events)."""
+    try:
+        pending = _bonus_pending()
+        now = time.time()
+        for oid, pdata in list(pending.items()):
+            if _bonus_is_processed(oid):
+                _bonus_remove_pending(oid)
+                continue
+            saved_at = pdata.get("saved_at", 0)
+            if now - saved_at > 3 * 3600:
+                logger.info(f"AutoCode bonus: processing stale pending order={oid}")
+                _bonus_apply(c, oid, pdata.get("short_desc"),
+                             pdata.get("chat_id"), pdata.get("chat_name", ""))
+    except Exception as e:
+        logger.warning(f"AutoCode bonus stale scan error: {e}")
 
 def init_autocode_tg(cardinal, *args):
     global _cardinal_ref
@@ -1778,6 +2133,9 @@ def init_autocode_tg(cardinal, *args):
     bot = cardinal.telegram.bot
 
     _load_lang_cache()
+
+    # Process any stale pending bonuses from before restart
+    Thread(target=_bonus_process_stale_pending, args=(cardinal,), daemon=True).start()
 
     _bcast = {"text": "", "failed": [], "retry_text": "", "scheduled_timer": None}
 
@@ -1887,59 +2245,109 @@ def init_autocode_tg(cardinal, *args):
         idx = len(accs) - 1
         msg = bot.send_message(message.chat.id,
             f"✅ Добавлен. IMAP: {auto_host}\nВведите пароль:")
-        bot.register_next_step_handler(msg, lambda m: _step_pass(m, idx))
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _step_pass(m, _i))
 
     def _step_pass(message: Message, idx: int):
         accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
         plain = message.text.strip()
         accs[idx]["password"] = _encrypt_password(plain)
         save_accs(accs)
-        bot.send_message(message.chat.id,
-            f"✅ Пароль сохранён (зашифрован).\n"
-            f"Используйте /autocode → 📬 Список почт → аккаунт для дополнительных настроек.")
+        _send_acc_card(message.chat.id, idx,
+                       prefix="✅ Аккаунт добавлен, пароль зашифрован.")
 
-    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_EDIT}:"))
-    def open_edit(call: CallbackQuery):
-        idx = int(call.data.split(":")[1])
+    # ── helpers: build account card & lots card ──
+
+    def _acc_card(idx):
+        """Build (text, keyboard) for account edit view."""
         accs = accounts()
         if idx >= len(accs):
-            _safe_answer(bot, call, "Аккаунт не найден.")
-            return
+            return None, None
         acc = accs[idx]
-        health = health_state().get(acc["email"], {})
-        h_str = "✅ ok" if health.get("ok", True) else f"❌ {health.get('message', '?')}"
-        last  = health.get("last_check")
-        last_str = _fmt_time(last) if last else "—"
+        h = health_state().get(acc["email"], {})
+        h_ok   = h.get("ok", True)
+        h_str  = "✅ ok" if h_ok else f"❌ {h.get('message', '?')}"
+        last   = h.get("last_check")
+        l_str  = _fmt_time(last) if last else "—"
+        lots   = acc.get("lot_ids", [])
+        ctype  = acc.get("code_type", "alnum")
+        clen   = acc.get("code_len", 0)
+        ihost  = acc.get("imap_host") or detect_imap_host(acc["email"])
+
         text = (
             f"📧 {acc['email']}\n"
-            f"🩺 Health: {h_str} (проверено: {last_str})\n"
-            f"🔌 IMAP: {acc.get('imap_host', detect_imap_host(acc['email']))}\n"
-            f"📦 Лоты: {', '.join(acc.get('lot_ids', [])) or 'все'}\n"
-            f"🔤 Тип: {acc.get('code_type', 'alnum')} | "
-            f"Длина: {acc.get('code_len', 0) or 'авто'}\n"
-            f"📬 От: {acc.get('filter_from') or '—'} | "
-            f"Тема: {acc.get('filter_subj') or '—'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🩺 Health: {h_str}\n"
+            f"    проверено: {l_str}\n"
+            f"🔌 IMAP: {ihost}\n"
+            f"📦 Лоты: {', '.join(lots) if lots else 'все'}\n"
+            f"🔤 Тип кода: {CODE_TYPE_RU.get(ctype, ctype)}\n"
+            f"🔢 Длина кода: {clen or 'авто'}\n"
+            f"📬 От: {acc.get('filter_from') or '—'}\n"
+            f"📌 Тема: {acc.get('filter_subj') or '—'}\n"
             f"🔐 Пароль: {'зашифрован ✅' if acc.get('password') else 'не задан ❌'}"
         )
         kb = K(keyboard=[
             [B("🔌 IMAP хост",      callback_data=f"{AC_IMAP}:{idx}"),
              B("📦 Лоты",           callback_data=f"{AC_LOTS}:{idx}")],
-            [B("🔢 Длина кода",     callback_data=f"{AC_LEN}:{idx}"),
-             B("🔤 Тип кода",       callback_data=f"{AC_TYPE}:{idx}")],
+            [B(f"🔢 Длина: {clen or 'авто'}", callback_data=f"{AC_LEN}:{idx}"),
+             B(f"🔤 {CODE_TYPE_RU.get(ctype, ctype)}", callback_data=f"{AC_TYPE}:{idx}")],
             [B("📬 От (from)",      callback_data=f"{AC_FROM}:{idx}"),
              B("📌 Тема",           callback_data=f"{AC_SUBJ}:{idx}")],
-            [B("🔑 Сменить пароль", callback_data=f"ac_chpass:{idx}"),
+            [B("🔑 Пароль",         callback_data=f"ac_chpass:{idx}"),
              B("🔍 Тест IMAP",      callback_data=f"{AC_TEST}:{idx}")],
             [B("🗑 Удалить",        callback_data=f"{AC_DEL_ASK}:{idx}")],
             [B("◀ Назад",           callback_data=f"{AC_LIST}:0")],
         ])
+        return text, kb
+
+    def _lots_card(idx):
+        """Build (text, keyboard) for lots view."""
+        accs = accounts()
+        if idx >= len(accs):
+            return None, None
+        acc  = accs[idx]
+        lots = acc.get("lot_ids", [])
+        if lots:
+            lines = [f"📦 Лоты для {acc['email']}:"]
+            for i, l in enumerate(lots, 1):
+                lines.append(f"  {i}. {l}")
+        else:
+            lines = [f"📦 Лоты для {acc['email']}:\n  (все лоты — без фильтра)"]
+        rows = [[B(f"🗑 {l}", callback_data=f"{AC_LOT_DEL}:{idx}:{l}")] for l in lots]
+        rows.append([B("➕ Добавить лот", callback_data=f"{AC_LOT_ADD}:{idx}")])
+        rows.append([B("◀ Назад",        callback_data=f"{AC_EDIT}:{idx}")])
+        return "\n".join(lines), K(keyboard=rows)
+
+    def _send_acc_card(chat_id, idx, prefix=""):
+        """Send account card as a new message (after text-input saves)."""
+        text, kb = _acc_card(idx)
+        if text is None:
+            bot.send_message(chat_id, "❌ Аккаунт не найден.")
+            return
+        bot.send_message(chat_id, (prefix + "\n\n" + text) if prefix else text,
+                         reply_markup=kb)
+
+    # ── account edit view ──
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_EDIT}:"))
+    def open_edit(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        text, kb = _acc_card(idx)
+        if text is None:
+            _safe_answer(bot, call, "Аккаунт не найден.")
+            return
         _safe_edit(bot, call, text, kb)
+
+    # ── password ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ac_chpass:"))
     def act_chpass(call: CallbackQuery):
         idx = int(call.data.split(":")[1])
-        msg = bot.send_message(call.message.chat.id, "Введите новый пароль:")
-        bot.register_next_step_handler(msg, lambda m: _do_chpass(m, idx))
+        msg = bot.send_message(call.message.chat.id, "🔑 Введите новый пароль:")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _do_chpass(m, _i))
 
     def _do_chpass(message: Message, idx: int):
         accs = accounts()
@@ -1948,7 +2356,9 @@ def init_autocode_tg(cardinal, *args):
             return
         accs[idx]["password"] = _encrypt_password(message.text.strip())
         save_accs(accs)
-        bot.send_message(message.chat.id, "✅ Пароль обновлён (зашифрован).")
+        _send_acc_card(message.chat.id, idx, prefix="✅ Пароль обновлён (зашифрован).")
+
+    # ── IMAP host ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_IMAP}:"))
     def act_imap(call: CallbackQuery):
@@ -1958,10 +2368,12 @@ def init_autocode_tg(cardinal, *args):
             _safe_answer(bot, call, "Аккаунт не найден.")
             return
         auto = detect_imap_host(accs[idx]["email"])
+        cur  = accs[idx].get("imap_host", auto)
         msg  = bot.send_message(call.message.chat.id,
-            f"Текущий IMAP: {accs[idx].get('imap_host', auto)}\n"
-            f"Авто: {auto}\nВведите новый хост или «авто»:")
-        bot.register_next_step_handler(msg, lambda m: _save_imap(m, idx))
+            f"🔌 Текущий IMAP: {cur}\n"
+            f"Авто-определение: {auto}\n\n"
+            f"Введите новый хост или «авто»:")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _save_imap(m, _i))
 
     def _save_imap(message: Message, idx: int):
         accs = accounts()
@@ -1973,7 +2385,10 @@ def init_autocode_tg(cardinal, *args):
             detect_imap_host(accs[idx]["email"]) if val.lower() == "авто" else val
         )
         save_accs(accs)
-        bot.send_message(message.chat.id, f"✅ IMAP: {accs[idx]['imap_host']}")
+        _send_acc_card(message.chat.id, idx,
+                       prefix=f"✅ IMAP хост: {accs[idx]['imap_host']}")
+
+    # ── IMAP test ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_TEST}:"))
     def do_test(call: CallbackQuery):
@@ -1982,41 +2397,63 @@ def init_autocode_tg(cardinal, *args):
         if idx >= len(accs):
             _safe_answer(bot, call, "Аккаунт не найден.", show_alert=True)
             return
-        result = test_imap(accs[idx])
-        h = health_state()
-        h[accs[idx]["email"]] = {
-            "last_check": time.time(),
-            "ok":         result.startswith("✅"),
-            "message":    result,
-        }
-        save_health(h)
-        _safe_answer(bot, call, result, show_alert=True)
+        _safe_answer(bot, call, "⏳ Проверяю IMAP...")
+
+        def _run_test():
+            result = test_imap(accs[idx])
+            h = health_state()
+            h[accs[idx]["email"]] = {
+                "last_check": time.time(),
+                "ok":         result.startswith("✅"),
+                "message":    result,
+            }
+            save_health(h)
+            # Refresh the card with updated health
+            text, kb = _acc_card(idx)
+            if text:
+                bot.send_message(call.message.chat.id,
+                    f"🔍 Результат: {result}\n\n{text}", reply_markup=kb)
+
+        Thread(target=_run_test, daemon=True).start()
+
+    # ── delete ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_DEL_ASK}:"))
     def ask_del(call: CallbackQuery):
-        idx = int(call.data.split(":")[1])
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        email = accs[idx]["email"] if idx < len(accs) else "?"
         kb  = K(keyboard=[
             [B("✅ Да, удалить", callback_data=f"{AC_DEL_OK}:{idx}"),
-             B("❌ Отмена",      callback_data=f"{AC_LIST}:0")],
+             B("❌ Отмена",      callback_data=f"{AC_EDIT}:{idx}")],
         ])
-        _safe_edit(bot, call, "Удалить аккаунт?", kb)
+        _safe_edit(bot, call, f"🗑 Удалить аккаунт {email}?", kb)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_DEL_OK}:"))
     def do_del(call: CallbackQuery):
         idx  = int(call.data.split(":")[1])
         accs = accounts()
         if idx < len(accs):
+            email = accs[idx]["email"]
             accs.pop(idx)
             save_accs(accs)
-        _safe_edit(bot, call, "🗑 Удалён.", kb_main())
+            _safe_edit(bot, call, f"🗑 Аккаунт {email} удалён.", kb_main())
+        else:
+            _safe_edit(bot, call, "🗑 Удалён.", kb_main())
+
+    # ── code length ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LEN}:"))
     def act_len(call: CallbackQuery):
-        idx = int(call.data.split(":")[1])
-        msg = bot.send_message(call.message.chat.id, "Введите длину кода (0 = авто):")
-        bot.register_next_step_handler(msg, lambda m: _save_int(m, idx, "code_len"))
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        cur  = accs[idx].get("code_len", 0) if idx < len(accs) else 0
+        msg  = bot.send_message(call.message.chat.id,
+            f"🔢 Текущая длина кода: {cur or 'авто'}\n"
+            f"Введите новую длину (0 = авто):")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _save_code_len(m, _i))
 
-    def _save_int(message: Message, idx: int, field: str):
+    def _save_code_len(message: Message, idx: int):
         try:
             val = int(message.text.strip())
         except ValueError:
@@ -2026,9 +2463,12 @@ def init_autocode_tg(cardinal, *args):
         if idx >= len(accs):
             bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
             return
-        accs[idx][field] = val
+        accs[idx]["code_len"] = val
         save_accs(accs)
-        bot.send_message(message.chat.id, f"✅ {field} = {val}")
+        _send_acc_card(message.chat.id, idx,
+                       prefix=f"✅ Длина кода: {val or 'авто'}")
+
+    # ── code type (inline toggle) ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_TYPE}:"))
     def act_type(call: CallbackQuery):
@@ -2042,57 +2482,87 @@ def init_autocode_tg(cardinal, *args):
         nxt   = types[(types.index(cur) + 1) % len(types)] if cur in types else "alnum"
         accs[idx]["code_type"] = nxt
         save_accs(accs)
-        _safe_answer(bot, call, f"Тип кода: {nxt}")
+        # Refresh card inline so the change is visible immediately
+        text, kb = _acc_card(idx)
+        if text:
+            _safe_edit(bot, call, text, kb)
+        _safe_answer(bot, call, f"Тип кода → {CODE_TYPE_RU.get(nxt, nxt)}")
+
+    # ── filter: from ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_FROM}:"))
     def act_from(call: CallbackQuery):
-        idx = int(call.data.split(":")[1])
-        msg = bot.send_message(call.message.chat.id, "Фильтр «От» (email отправителя, или пусто):")
-        bot.register_next_step_handler(msg, lambda m: _save_str(m, idx, "filter_from"))
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        cur  = accs[idx].get("filter_from", "") if idx < len(accs) else ""
+        msg  = bot.send_message(call.message.chat.id,
+            f"📬 Текущий фильтр «От»: {cur or '—'}\n"
+            f"Введите email отправителя (или «—» для сброса):")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _save_from(m, _i))
 
-    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_SUBJ}:"))
-    def act_subj(call: CallbackQuery):
-        idx = int(call.data.split(":")[1])
-        msg = bot.send_message(call.message.chat.id, "Фильтр по теме письма (или пусто):")
-        bot.register_next_step_handler(msg, lambda m: _save_str(m, idx, "filter_subj"))
-
-    def _save_str(message: Message, idx: int, field: str):
+    def _save_from(message: Message, idx: int):
         accs = accounts()
         if idx >= len(accs):
             bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
             return
-        accs[idx][field] = message.text.strip()
+        val = message.text.strip()
+        accs[idx]["filter_from"] = "" if val in ("—", "-", "") else val
         save_accs(accs)
-        bot.send_message(message.chat.id, f"✅ {field} сохранён.")
+        _send_acc_card(message.chat.id, idx,
+                       prefix=f"✅ Фильтр «От»: {accs[idx]['filter_from'] or '—'}")
+
+    # ── filter: subject ──
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_SUBJ}:"))
+    def act_subj(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        cur  = accs[idx].get("filter_subj", "") if idx < len(accs) else ""
+        msg  = bot.send_message(call.message.chat.id,
+            f"📌 Текущий фильтр по теме: {cur or '—'}\n"
+            f"Введите тему (или «—» для сброса):")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _save_subj(m, _i))
+
+    def _save_subj(message: Message, idx: int):
+        accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
+        val = message.text.strip()
+        accs[idx]["filter_subj"] = "" if val in ("—", "-", "") else val
+        save_accs(accs)
+        _send_acc_card(message.chat.id, idx,
+                       prefix=f"✅ Фильтр по теме: {accs[idx]['filter_subj'] or '—'}")
+
+    # ── lots management ──
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOTS}:"))
     def open_lots(call: CallbackQuery):
         idx  = int(call.data.split(":")[1])
-        accs = accounts()
-        if idx >= len(accs):
+        text, kb = _lots_card(idx)
+        if text is None:
             _safe_answer(bot, call, "Аккаунт не найден.")
             return
-        acc  = accs[idx]
-        lots = acc.get("lot_ids", [])
-        rows = [[B(f"🗑 {l}", callback_data=f"{AC_LOT_DEL}:{idx}:{l}")] for l in lots]
-        rows.append([B("➕ Добавить лот", callback_data=f"{AC_LOT_ADD}:{idx}")])
-        rows.append([B("◀ Назад",        callback_data=f"{AC_EDIT}:{idx}")])
-        _safe_edit(bot, call, f"Лоты для {acc['email']}:", K(keyboard=rows))
+        _safe_edit(bot, call, text, kb)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOT_ADD}:"))
     def act_lot_add(call: CallbackQuery):
         idx = int(call.data.split(":")[1])
-        msg = bot.send_message(call.message.chat.id, "Введите ID лота:")
-        bot.register_next_step_handler(msg, lambda m: _do_lot_add(m, idx))
+        msg = bot.send_message(call.message.chat.id, "📦 Введите ID лота:")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _do_lot_add(m, _i))
 
     def _do_lot_add(message: Message, idx: int):
         accs = accounts()
         if idx >= len(accs):
             bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
             return
-        accs[idx].setdefault("lot_ids", []).append(message.text.strip())
+        lot_id = message.text.strip()
+        accs[idx].setdefault("lot_ids", []).append(lot_id)
         save_accs(accs)
-        bot.send_message(message.chat.id, "✅ Лот добавлен.")
+        # Send refreshed lots card
+        text, kb = _lots_card(idx)
+        bot.send_message(message.chat.id,
+            f"✅ Лот {lot_id} добавлен.\n\n{text}", reply_markup=kb)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_LOT_DEL}:"))
     def act_lot_del(call: CallbackQuery):
@@ -2104,7 +2574,11 @@ def init_autocode_tg(cardinal, *args):
             return
         accs[idx]["lot_ids"] = [l for l in accs[idx].get("lot_ids", []) if l != lot]
         save_accs(accs)
-        _safe_answer(bot, call, f"Лот {lot} удалён.")
+        # Refresh lots list inline
+        text, kb = _lots_card(idx)
+        if text:
+            _safe_edit(bot, call, text, kb)
+        _safe_answer(bot, call, f"🗑 Лот {lot} удалён.")
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_LOG)
     def open_log(call: CallbackQuery):
@@ -2123,106 +2597,138 @@ def init_autocode_tg(cardinal, *args):
     @bot.callback_query_handler(func=lambda c: c.data == AC_RENTALS or c.data.startswith(f"{AC_RENT_PAGE}:"))
     def open_rentals(call: CallbackQuery):
         try:
-            page = int(call.data.split(":")[1]) if ":" in call.data else 0
-        except Exception:
             page = 0
+            try:
+                page = int(call.data.split(":")[1]) if ":" in call.data else 0
+            except Exception:
+                pass
 
-        active = sorted(get_active_rentals(), key=lambda r: _safe_ts(r.get("expires_at", 0)))
-        total  = len(active)
+            active = sorted(get_active_rentals(), key=lambda r: _safe_ts(r.get("expires_at", 0)))
+            total  = len(active)
 
-        if total == 0:
-            _safe_edit(bot, call, "🏠 Активные аренды\n\nНет активных аренд.",
-                K(keyboard=[[B("🔄 Обновить", callback_data=f"{AC_RENT_PAGE}:0"),
-                             B("◀ Назад",   callback_data=AC_MAIN)]]))
-            return
+            if total == 0:
+                _safe_edit(bot, call, "🏠 Активные аренды\n\nНет активных аренд.",
+                    K(keyboard=[[B("🔄 Обновить", callback_data=f"{AC_RENT_PAGE}:0"),
+                                 B("◀ Назад",   callback_data=AC_MAIN)]]))
+                return
 
-        pages_total = (total + RENTALS_PAGE_SIZE - 1) // RENTALS_PAGE_SIZE
-        page = max(0, min(page, pages_total - 1))
-        start = page * RENTALS_PAGE_SIZE
-        chunk = active[start:start + RENTALS_PAGE_SIZE]
+            pages_total = (total + RENTALS_PAGE_SIZE - 1) // RENTALS_PAGE_SIZE
+            page = max(0, min(page, pages_total - 1))
+            start = page * RENTALS_PAGE_SIZE
+            chunk = active[start:start + RENTALS_PAGE_SIZE]
 
-        lines = [f"🏠 Активные аренды — стр. {page + 1}/{pages_total}",
-                 f"Всего: {total}\n"]
-        rows  = []
-        for r in chunk:
-            buyer    = (r.get("buyer") or "—")[:18]
-            remain   = _fmt_remaining_compact(r.get("expires_at", 0))
-            warn     = "⚠️" if not r.get("chat_id") else ""
-            lang     = r.get("lang", "ru")
-            lang_tag = "🇷🇺" if lang == "ru" else "🇬🇧"
-            lines.append(f"{lang_tag} {buyer} • ⏳{remain} {warn}")
-            rows.append([B(f"⚙️ {buyer}", callback_data=f"{AC_RENT_INFO}:{r['order_key']}")])
+            now_ts = time.time()
+            lines = [f"🏠 Активные аренды — стр. {page + 1}/{pages_total}",
+                     f"Всего: {total}\n"]
+            rows  = []
+            for r in chunk:
+                buyer    = (r.get("buyer") or "—")[:18]
+                remain   = _fmt_remaining_compact(r.get("expires_at", 0))
+                warn     = "⚠️" if not r.get("chat_id") else ""
+                left_h = (_safe_ts(r.get("expires_at", 0)) - now_ts) / 3600
+                if left_h > 24:
+                    color = "🟢"
+                elif left_h > 12:
+                    color = "🟡"
+                elif left_h > 2:
+                    color = "🟠"
+                else:
+                    color = "🔴"
+                lines.append(f"{color} {buyer} • ⏳{remain} {warn}")
+                order_key = r.get("order_key") or "?"
+                rows.append([B(f"{color} {buyer}", callback_data=f"{AC_RENT_INFO}:{order_key}")])
 
-        nav = []
-        if page > 0:
-            nav.append(B("⏮", callback_data=f"{AC_RENT_PAGE}:0"))
-            nav.append(B("◀", callback_data=f"{AC_RENT_PAGE}:{page - 1}"))
-        nav.append(B(f"🔄 {page + 1}/{pages_total}", callback_data=f"{AC_RENT_PAGE}:{page}"))
-        if page < pages_total - 1:
-            nav.append(B("▶", callback_data=f"{AC_RENT_PAGE}:{page + 1}"))
-            nav.append(B("⏭", callback_data=f"{AC_RENT_PAGE}:{pages_total - 1}"))
-        if nav:
-            rows.append(nav)
+            nav = []
+            if page > 0:
+                nav.append(B("⏮", callback_data=f"{AC_RENT_PAGE}:0"))
+                nav.append(B("◀", callback_data=f"{AC_RENT_PAGE}:{page - 1}"))
+            nav.append(B(f"🔄 {page + 1}/{pages_total}", callback_data=f"{AC_RENT_PAGE}:{page}"))
+            if page < pages_total - 1:
+                nav.append(B("▶", callback_data=f"{AC_RENT_PAGE}:{page + 1}"))
+                nav.append(B("⏭", callback_data=f"{AC_RENT_PAGE}:{pages_total - 1}"))
+            if nav:
+                rows.append(nav)
 
-        rows.append([B("◀ Назад в меню", callback_data=AC_MAIN)])
+            rows.append([B("◀ Назад в меню", callback_data=AC_MAIN)])
 
-        lines.append("\n⚠️ = без chat_id (нет уведомлений)")
-        _safe_edit(bot, call, "\n".join(lines), K(keyboard=rows))
+            lines.append("\n🟢 >24ч  🟡 12-24ч  🟠 2-12ч  🔴 <2ч")
+            lines.append("⚠️ = без chat_id")
+            _safe_edit(bot, call, "\n".join(lines), K(keyboard=rows))
+        except Exception as exc:
+            logger.error(f"AutoCode open_rentals CRASH: {exc}", exc_info=True)
+            try:
+                _safe_edit(bot, call, f"⚠️ Ошибка загрузки аренд:\n{exc}",
+                    K(keyboard=[[B("🔄 Обновить", callback_data=f"{AC_RENT_PAGE}:0"),
+                                 B("◀ Назад", callback_data=AC_MAIN)]]))
+            except Exception:
+                pass
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_INFO}:"))
     def rent_info(call: CallbackQuery):
-        key = call.data.split(":", 1)[1]
-        rents = rentals()
-        r = rents.get(key)
-        if not r:
-            _safe_answer(bot, call, "Аренда не найдена.")
-            return
-        text = (
-            f"🏠 Аренда {r.get('buyer', '—')}\n\n"
-            f"📧 Почта: {r.get('email', '—')}\n"
-            f"📦 Лот: {r.get('lot_id', '—')}\n"
-            f"🌐 Язык: {r.get('lang', 'ru')}\n"
-            f"💬 chat_id: {r.get('chat_id') or '⚠️ нет'}\n"
-            f"🕐 Куплено: {_fmt_time(r.get('purchase_ts', 0))}\n"
-            f"⏰ Окончание: {_fmt_time(r.get('expires_at', 0))}\n"
-            f"⏳ Осталось: {_fmt_remaining(r.get('expires_at', 0))}\n"
-        )
-        kb = K(keyboard=[
-            [B("➕ 1ч",  callback_data=f"{AC_RENT_EXT}:{key}:1"),
-             B("➕ 6ч",  callback_data=f"{AC_RENT_EXT}:{key}:6"),
-             B("➕ 24ч", callback_data=f"{AC_RENT_EXT}:{key}:24")],
-            [B("🗑 Удалить",  callback_data=f"{AC_RENT_DEL}:{key}")],
-            [B("◀ К списку", callback_data=f"{AC_RENT_PAGE}:0")],
-        ])
-        _safe_edit(bot, call, text, kb)
+        try:
+            key = call.data.split(":", 1)[1]
+            rents = rentals()
+            r = rents.get(key)
+            if not r:
+                _safe_answer(bot, call, "Аренда не найдена.")
+                return
+            text = (
+                f"🏠 Аренда {r.get('buyer', '—')}\n\n"
+                f"📧 Почта: {r.get('email', '—')}\n"
+                f"📦 Лот: {r.get('lot_id', '—')}\n"
+                f"🌐 Язык: {r.get('lang', 'ru')}\n"
+                f"💬 chat_id: {r.get('chat_id') or '⚠️ нет'}\n"
+                f"🕐 Куплено: {_fmt_time(r.get('purchase_ts', 0))}\n"
+                f"⏰ Окончание: {_fmt_time(r.get('expires_at', 0))}\n"
+                f"⏳ Осталось: {_fmt_remaining(r.get('expires_at', 0))}\n"
+            )
+            kb = K(keyboard=[
+                [B("➕ 1ч",  callback_data=f"{AC_RENT_EXT}:{key}:1"),
+                 B("➕ 6ч",  callback_data=f"{AC_RENT_EXT}:{key}:6"),
+                 B("➕ 24ч", callback_data=f"{AC_RENT_EXT}:{key}:24")],
+                [B("🗑 Удалить",  callback_data=f"{AC_RENT_DEL}:{key}")],
+                [B("◀ К списку", callback_data=f"{AC_RENT_PAGE}:0")],
+            ])
+            _safe_edit(bot, call, text, kb)
+        except Exception as exc:
+            logger.error(f"AutoCode rent_info CRASH: {exc}", exc_info=True)
+            _safe_answer(bot, call, f"Ошибка: {exc}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_DEL}:"))
     def do_rent_del(call: CallbackQuery):
-        key   = call.data.split(":", 1)[1]
-        rents = rentals()
-        rents.pop(key, None)
-        save_rentals(rents)
-        _safe_answer(bot, call, "Аренда удалена.")
-        call.data = f"{AC_RENT_PAGE}:0"
-        open_rentals(call)
+        try:
+            key   = call.data.split(":", 1)[1]
+            rents = rentals()
+            rents.pop(key, None)
+            save_rentals(rents)
+            _safe_answer(bot, call, "Аренда удалена.")
+            call.data = f"{AC_RENT_PAGE}:0"
+            open_rentals(call)
+        except Exception as exc:
+            logger.error(f"AutoCode do_rent_del CRASH: {exc}", exc_info=True)
+            _safe_answer(bot, call, f"Ошибка: {exc}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RENT_EXT}:"))
     def do_rent_ext(call: CallbackQuery):
-        parts = call.data.split(":")
-        key, hours = parts[1], int(parts[2])
-        rents = rentals()
-        if key in rents:
-            rents[key]["expires_at"] = _safe_ts(rents[key].get("expires_at", 0)) + hours * 3600
-            rents[key]["hours"] = rents[key].get("hours", 0) + hours
-            save_rentals(rents)
-            state = warned_state()
-            for s_key in ("warned_4h", "warned_30m"):
-                if key in state.get(s_key, []):
-                    state[s_key].remove(key)
-            save_warned(state)
-        _safe_answer(bot, call, f"Продлено на {hours}ч.")
-        call.data = f"{AC_RENT_INFO}:{key}"
-        rent_info(call)
+        try:
+            parts = call.data.split(":")
+            key, hours = parts[1], int(parts[2])
+            rents = rentals()
+            if key in rents:
+                rents[key]["expires_at"] = _safe_ts(rents[key].get("expires_at", 0)) + hours * 3600
+                rents[key]["hours"] = rents[key].get("hours", 0) + hours
+                save_rentals(rents)
+                state = warned_state()
+                for s_key in ("warned_12h",):
+                    if key in state.get(s_key, []):
+                        state[s_key].remove(key)
+                save_warned(state)
+            _safe_answer(bot, call, f"Продлено на {hours}ч.")
+            call.data = f"{AC_RENT_INFO}:{key}"
+            rent_info(call)
+        except Exception as exc:
+            logger.error(f"AutoCode do_rent_ext CRASH: {exc}", exc_info=True)
+            _safe_answer(bot, call, f"Ошибка: {exc}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_STATS)
     def open_stats(call: CallbackQuery):
@@ -2319,19 +2825,25 @@ def init_autocode_tg(cardinal, *args):
     def open_review(call: CallbackQuery):
         s = app_settings()
         text = (
-            f"⚙️ Настройки\n\n"
+            f"⚙️ Настройки\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📝 Запрос отзыва: {'✅ вкл' if s.get('review_enabled', True) else '❌ выкл'}\n"
-            f"   Через 30 мин после выдачи кода.\n"
-            f"   Шаблон: {s.get('review_template', '')[:80]}...\n\n"
-            f"🔄 Win-back: {'✅ вкл' if s.get('winback_enabled', True) else '❌ выкл'}\n"
-            f"   Через {WINBACK_AFTER_DAYS}+ дней простоя.\n"
-            f"   Шаблон: {s.get('winback_template', '')[:80]}..."
+            f"   {s.get('review_template', '')[:80]}\n\n"
+            f"🔄 Возврат клиентов: {'✅ вкл' if s.get('winback_enabled', True) else '❌ выкл'}\n"
+            f"   Через {WINBACK_AFTER_DAYS}+ дней простоя\n"
+            f"   {s.get('winback_template', '')[:80]}\n\n"
+            f"✅ Подтверждение заказа: {'✅ вкл' if s.get('confirm_enabled', True) else '❌ выкл'}\n"
+            f"   Через 5 мин после кода\n\n"
+            f"📋 FAQ доп. текст: {s.get('faq_custom_ru', '')[:60] or '(пусто)'}"
         )
         kb = K(keyboard=[
-            [B("📝 Вкл/выкл отзывы",  callback_data="ac_rev_toggle"),
-             B("✏️ Шаблон отзыва",    callback_data="ac_rev_tpl")],
-            [B("🔄 Вкл/выкл win-back", callback_data="ac_wb_toggle"),
-             B("✏️ Шаблон win-back",   callback_data=AC_WB_TPL)],
+            [B("📝 Вкл/выкл отзывы",      callback_data="ac_rev_toggle"),
+             B("✏️ Шаблон отзыва",         callback_data="ac_rev_tpl")],
+            [B("🔄 Вкл/выкл возврат",      callback_data="ac_wb_toggle"),
+             B("✏️ Шаблон возврата",        callback_data=AC_WB_TPL)],
+            [B("✅ Вкл/выкл подтверждение", callback_data="ac_confirm_toggle")],
+            [B("📋 FAQ доп. текст",         callback_data="ac_faq_tpl_ru")],
+            [B("📝 Все тексты сообщений",   callback_data="ac_texts_menu")],
             [B("◀ Назад", callback_data=AC_MAIN)],
         ])
         _safe_edit(bot, call, text, kb)
@@ -2346,34 +2858,128 @@ def init_autocode_tg(cardinal, *args):
 
     @bot.callback_query_handler(func=lambda c: c.data == "ac_rev_tpl")
     def rev_tpl(call: CallbackQuery):
-        msg = bot.send_message(call.message.chat.id, "Введите новый шаблон запроса отзыва:")
+        msg = bot.send_message(call.message.chat.id,
+            f"Текущий шаблон отзыва:\n{app_settings().get('review_template', '')}\n\nВведите новый:")
         bot.register_next_step_handler(msg, _save_review_tpl)
 
     def _save_review_tpl(message: Message):
         s = app_settings()
         s["review_template"] = message.text.strip()
         save_settings(s)
-        bot.send_message(message.chat.id, "✅ Шаблон сохранён.")
+        bot.send_message(message.chat.id, "✅ Шаблон отзыва сохранён.")
 
     @bot.callback_query_handler(func=lambda c: c.data == "ac_wb_toggle")
     def wb_toggle(call: CallbackQuery):
         s = app_settings()
         s["winback_enabled"] = not s.get("winback_enabled", True)
         save_settings(s)
-        _safe_answer(bot, call, f"Win-back: {'вкл' if s['winback_enabled'] else 'выкл'}")
+        _safe_answer(bot, call, f"Возврат: {'вкл' if s['winback_enabled'] else 'выкл'}")
         open_review(call)
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_WB_TPL)
     def wb_tpl(call: CallbackQuery):
         msg = bot.send_message(call.message.chat.id,
-            "Введите новый шаблон win-back сообщения:")
+            f"Текущий шаблон возврата:\n{app_settings().get('winback_template', '')}\n\nВведите новый:")
         bot.register_next_step_handler(msg, _save_wb_tpl)
 
     def _save_wb_tpl(message: Message):
         s = app_settings()
         s["winback_template"] = message.text.strip()
         save_settings(s)
-        bot.send_message(message.chat.id, "✅ Шаблон win-back сохранён.")
+        bot.send_message(message.chat.id, "✅ Шаблон возврата сохранён.")
+
+    @bot.callback_query_handler(func=lambda c: c.data == "ac_confirm_toggle")
+    def confirm_toggle(call: CallbackQuery):
+        s = app_settings()
+        s["confirm_enabled"] = not s.get("confirm_enabled", True)
+        save_settings(s)
+        _safe_answer(bot, call, f"Подтверждение заказа: {'вкл' if s['confirm_enabled'] else 'выкл'}")
+        open_review(call)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "ac_faq_tpl_ru")
+    def faq_tpl_ru(call: CallbackQuery):
+        cur = app_settings().get("faq_custom_ru", "")
+        msg = bot.send_message(call.message.chat.id,
+            f"📋 Доп. текст FAQ (добавляется после списка команд):\n"
+            f"{cur or '(пусто)'}\n\nВведите новый (или «—» для очистки):")
+        bot.register_next_step_handler(msg, _save_faq_ru)
+
+    def _save_faq_ru(message: Message):
+        s = app_settings()
+        val = message.text.strip()
+        s["faq_custom_ru"] = "" if val in ("—", "-") else val
+        save_settings(s)
+        bot.send_message(message.chat.id, "✅ FAQ текст сохранён.")
+
+    # ── Editable texts menu (all buyer-facing messages) ──
+
+    _TEXTS_PAGE_SIZE = 6
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ac_texts_menu"))
+    def texts_menu(call: CallbackQuery):
+        parts = call.data.split(":")
+        page = int(parts[1]) if len(parts) > 1 else 0
+        items = list(_EDITABLE_TEXTS.items())
+        total_pages = (len(items) + _TEXTS_PAGE_SIZE - 1) // _TEXTS_PAGE_SIZE
+        start = page * _TEXTS_PAGE_SIZE
+        page_items = items[start:start + _TEXTS_PAGE_SIZE]
+        s = app_settings()
+        overrides = s.get("texts", {})
+        lines = ["📝 Все тексты сообщений\n"]
+        for display_name, key in page_items:
+            is_custom = "✏️" if key in overrides else "📄"
+            lines.append(f"{is_custom} {display_name}")
+        text = "\n".join(lines)
+        text += f"\n\nСтр. {page + 1}/{total_pages}  |  ✏️=изменён  📄=стандарт"
+        buttons = []
+        for display_name, key in page_items:
+            buttons.append([B(f"✏️ {display_name}", callback_data=f"ac_txt_edit:{key}")])
+        nav = []
+        if page > 0:
+            nav.append(B("◀ Назад", callback_data=f"ac_texts_menu:{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(B("Вперёд ▶", callback_data=f"ac_texts_menu:{page + 1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([B("🔄 Сбросить все", callback_data="ac_txt_reset_all"),
+                        B("◀ Назад", callback_data=AC_REVIEW)])
+        _safe_edit(bot, call, text, K(keyboard=buttons))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ac_txt_edit:"))
+    def txt_edit(call: CallbackQuery):
+        key = call.data.split(":", 1)[1]
+        s = app_settings()
+        overrides = s.get("texts", {})
+        current = overrides.get(key) or L_DEFAULTS.get(key, "")
+        display_name = next((dn for dn, k in _EDITABLE_TEXTS.items() if k == key), key)
+        msg = bot.send_message(call.message.chat.id,
+            f"✏️ {display_name}\n\n"
+            f"Текущий текст:\n{current}\n\n"
+            f"Переменные (оставляйте как есть): " + ", ".join(
+                f"{{{v}}}" for v in re.findall(r"\{(\w+)\}", current)
+            ) + "\n\nВведите новый текст (или «—» для сброса к стандарту):")
+        bot.register_next_step_handler(msg, lambda m, _k=key: _save_txt(m, _k))
+
+    def _save_txt(message: Message, key: str):
+        s = app_settings()
+        val = message.text.strip()
+        if val in ("—", "-"):
+            s.setdefault("texts", {}).pop(key, None)
+            save_settings(s)
+            bot.send_message(message.chat.id, f"✅ Сброшено к стандарту.")
+        else:
+            s.setdefault("texts", {})[key] = val
+            save_settings(s)
+            display_name = next((dn for dn, k in _EDITABLE_TEXTS.items() if k == key), key)
+            bot.send_message(message.chat.id, f"✅ {display_name} — сохранён.")
+
+    @bot.callback_query_handler(func=lambda c: c.data == "ac_txt_reset_all")
+    def txt_reset_all(call: CallbackQuery):
+        s = app_settings()
+        s["texts"] = {}
+        save_settings(s)
+        _safe_answer(bot, call, "Все тексты сброшены к стандарту.")
+        texts_menu(call)
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_WINBACK)
     def open_winback(call: CallbackQuery):
@@ -2398,8 +3004,8 @@ def init_autocode_tg(cardinal, *args):
                 candidates.append((b, d))
 
         text = (
-            f"🔄 Win-back\n\n"
-            f"Кандидатов (3-30 дн): <b>{len(candidates)}</b>\n"
+            f"🔄 Возврат клиентов\n\n"
+            f"Кандидатов ({WINBACK_AFTER_DAYS}-{WINBACK_MAX_DAYS} дн): <b>{len(candidates)}</b>\n"
             f"Уже отправлено: <b>{len(sent)}</b>\n\n"
         )
         if candidates:
@@ -2409,7 +3015,7 @@ def init_autocode_tg(cardinal, *args):
 
         kb = K(keyboard=[
             [B(f"📤 Отправить всем ({len(candidates)})", callback_data=AC_WB_RUN)],
-            [B("✏️ Шаблон", callback_data=AC_WB_TPL)],
+            [B("✏️ Шаблон возврата", callback_data=AC_WB_TPL)],
             [B("◀ Назад", callback_data=AC_MAIN)],
         ])
         _safe_edit(bot, call, text, kb, parse_mode="HTML")
@@ -2728,8 +3334,8 @@ def _winback_manual_run(cardinal):
                 if not cid:
                     continue
 
-                text = settings.get("winback_template", "")
-                success, _ = _send_with_retry(cardinal, cid, text, buyer)
+                tpl = settings.get("winback_template", "")
+                success, _ = _send_with_retry(cardinal, cid, tpl, buyer)
                 if success:
                     sent_log[buyer] = {
                         "sent_at": now,

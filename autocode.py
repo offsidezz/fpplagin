@@ -1161,11 +1161,41 @@ def _startup_sales_scan(cardinal):
 
         existing_order_ids = {str(r.get("order_id")) for r in rents.values() if r.get("order_id")}
 
+        # Log first shortcut's attributes to help debug lot_name detection
+        if all_shortcuts:
+            s0 = all_shortcuts[0]
+            attr_dump = {k: repr(getattr(s0, k, "?"))[:80]
+                         for k in dir(s0)
+                         if not k.startswith("_") and isinstance(getattr(s0, k, None), str)}
+            logger.info(f"AutoCode: shortcut attrs sample: {attr_dump}")
+
         for shortcut in all_shortcuts:
             try:
                 order_id  = str(getattr(shortcut, "id", "") or getattr(shortcut, "order_id", ""))
-                lot_name = getattr(shortcut, "description", None) or getattr(shortcut, "lot_name", None) or ""
-                logger.debug(f"Restore lot_name: {lot_name!r}")
+
+                # Try multiple attributes to find lot title with duration
+                _lot_candidates = []
+                for _attr in ("description", "lot_name", "title", "lot_title",
+                              "short_description", "subcategory_name", "name"):
+                    _val = getattr(shortcut, _attr, None)
+                    if _val and isinstance(_val, str):
+                        _lot_candidates.append(_val)
+                # Also try str(shortcut) as last resort
+                try:
+                    _str_val = str(shortcut)
+                    if _str_val and len(_str_val) > 5:
+                        _lot_candidates.append(_str_val)
+                except Exception:
+                    pass
+
+                lot_name = ""
+                for _cand in _lot_candidates:
+                    if _parse_hours(_cand):
+                        lot_name = _cand
+                        break
+                if not lot_name:
+                    lot_name = _lot_candidates[0] if _lot_candidates else ""
+
                 buyer     = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
                 lot_id    = str(getattr(shortcut, "lot_id", "") or "")
 
@@ -1207,6 +1237,10 @@ def _startup_sales_scan(cardinal):
                 if not hours:
                     skipped += 1
                     skip_no_hours += 1
+                    if skip_no_hours <= 5:
+                        logger.warning(
+                            f"AutoCode: scan skip (no hours) #{skip_no_hours}: "
+                            f"lot_name={lot_name!r:.120}, order_id={order_id}")
                     continue
 
                 expires_at = purchase_ts + hours * 3600
@@ -1567,10 +1601,35 @@ def on_new_order(c, e: NewOrderEvent):
 
     desc     = getattr(e.order, "description", "") or ""
     lot_name = getattr(e.order, "lot_name", "") or desc
-    hours    = _parse_hours(lot_name) or _parse_hours(desc)
+
+    # Try multiple attributes to find text with duration
+    hours = _parse_hours(lot_name) or _parse_hours(desc)
     if not hours:
+        for _attr in ("title", "lot_title", "short_description",
+                       "subcategory_name", "name"):
+            _val = getattr(e.order, _attr, None)
+            if _val and isinstance(_val, str):
+                hours = _parse_hours(_val)
+                if hours:
+                    lot_name = _val
+                    break
+        if not hours:
+            try:
+                _str_val = str(e.order)
+                hours = _parse_hours(_str_val)
+                if hours:
+                    lot_name = _str_val
+            except Exception:
+                pass
+
+    if not hours:
+        # Log all string attrs for debugging
+        _attrs = {k: repr(getattr(e.order, k, "?"))[:60]
+                  for k in dir(e.order)
+                  if not k.startswith("_") and isinstance(getattr(e.order, k, None), str)}
         logger.warning(f"AutoCode: ⚠️ не удалось определить часы из названия лота: {lot_name!r} / {desc!r}. "
-                       f"Аренда НЕ создана. Добавьте длительность в название (напр. '24ч', '30 дней').")
+                       f"Аренда НЕ создана. Добавьте длительность в название (напр. '24ч', '30 дней'). "
+                       f"Attrs: {_attrs}")
         return
 
     buyer     = getattr(e.order, "buyer_username", "") or ""

@@ -93,9 +93,6 @@ AC_BCAST_SCHED   = "ac_bcast_sched"
 AC_IMAP          = "ac_imap"
 AC_HEALTH        = "ac_health"
 AC_REVIEW        = "ac_review"
-AC_WINBACK       = "ac_winback"
-AC_WB_RUN        = "ac_wb_run"
-AC_WB_TPL        = "ac_wb_tpl"
 AC_CHECK_ALL     = "ac_check_all"
 
 CODE_TYPE_RU = {
@@ -116,11 +113,8 @@ TEMPLATES_FILE  = os.path.join(DATA_DIR, "templates.json")
 BCAST_HIST_FILE = os.path.join(DATA_DIR, "broadcast_history.json")
 WARNED_FILE     = os.path.join(DATA_DIR, "warned_state.json")
 HEALTH_FILE     = os.path.join(DATA_DIR, "imap_health.json")
-WINBACK_FILE    = os.path.join(DATA_DIR, "winback_sent.json")
 SETTINGS_FILE   = os.path.join(DATA_DIR, "settings.json")
 LANG_CACHE_FILE = os.path.join(DATA_DIR, "lang_cache.json")
-BONUS_LOG_FILE  = os.path.join(DATA_DIR, "bonus_hours_log.json")
-BONUS_PENDING_FILE = os.path.join(DATA_DIR, "bonus_pending.json")
 
 ENCRYPTED_FILES = {RENTALS_FILE, USED_FILE, ACCOUNTS_FILE}
 
@@ -148,11 +142,11 @@ USED_CODE_TTL_SEC     = 3 * 3600
 WEEKLY_REPORT_DOW     = 6
 WEEKLY_REPORT_HOUR    = 9
 RENTAL_GRACE_SEC      = 300
+LOYALTY_WINDOW_DAYS   = 7          # repurchase within N days → bonus
+LOYALTY_BONUS_DAYS    = 7          # bonus days for loyal buyers
 HEALTH_CHECK_INTERVAL = 3600
 REVIEW_DELAY_SEC      = 30 * 60
 ORDER_CONFIRM_DELAY   = 5 * 60   # 5 min after code → ask buyer to confirm order
-WINBACK_AFTER_DAYS    = 3
-WINBACK_MAX_DAYS      = 30
 RENTALS_PAGE_SIZE     = 8
 BROADCAST_COOLDOWN_SEC = 3
 BROADCAST_RETRY_MAX    = 3
@@ -376,21 +370,13 @@ def warned_state():        return _load(WARNED_FILE, {"warned_12h": []})
 def save_warned(d):        _save(WARNED_FILE, d)
 def health_state():        return _load(HEALTH_FILE, {})
 def save_health(d):        _save(HEALTH_FILE, d)
-def winback_sent():        return _load(WINBACK_FILE, {})
-def save_winback(d):       _save(WINBACK_FILE, d)
 def lang_cache():          return _load(LANG_CACHE_FILE, {})
 def save_lang_cache(d):    _save(LANG_CACHE_FILE, d)
 def app_settings():        return _load(SETTINGS_FILE, {
     "review_enabled":   True,
     "review_template":  "Если код подошёл — буду благодарен за отзыв 🙏 Это очень помогает!",
-    "winback_enabled":  True,
-    "winback_template": "👋 Скучаем! Возвращайся — даём промокод RETURN25 на скидку 25% на следующую аренду. Просто напиши в чат, когда соберёшься заказывать.",
-    "winback_discount": 25,
     "confirm_enabled":  True,
     "queue_pause_sec":  2,
-    "bonus_hours_enabled":  True,
-    "bonus_hours_pattern": r"[+➕]\s*(\d+)\s*[Чч]",
-    "bonus_fallback":     0,
     "faq_custom_ru":      "",
     "texts":              {},
 })
@@ -398,195 +384,6 @@ def save_settings(d):      _save(SETTINGS_FILE, d)
 
 
 # ── Bonus hours for review ──
-BONUS_LOG_LOCK = Lock()
-
-def _bonus_load_log() -> dict:
-    _ensure()
-    if not os.path.exists(BONUS_LOG_FILE):
-        return {"processed_orders": []}
-    try:
-        with open(BONUS_LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return {"processed_orders": []}
-
-def _bonus_save_log(log: dict):
-    _ensure()
-    with open(BONUS_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
-
-def _bonus_is_processed(order_id) -> bool:
-    log = _bonus_load_log()
-    return str(order_id) in log.get("processed_orders", [])
-
-def _bonus_mark_processed(order_id):
-    with BONUS_LOG_LOCK:
-        log = _bonus_load_log()
-        if str(order_id) not in log.get("processed_orders", []):
-            log.setdefault("processed_orders", []).append(str(order_id))
-            _bonus_save_log(log)
-
-def _bonus_pending() -> dict:
-    return _load(BONUS_PENDING_FILE, {})
-
-def _bonus_save_pending(d: dict):
-    _save(BONUS_PENDING_FILE, d)
-
-def _bonus_add_pending(order_id: str, order_data: dict):
-    with BONUS_LOG_LOCK:
-        p = _bonus_pending()
-        if order_id not in p:
-            p[order_id] = order_data
-            _bonus_save_pending(p)
-
-def _bonus_remove_pending(order_id: str):
-    with BONUS_LOG_LOCK:
-        p = _bonus_pending()
-        if order_id in p:
-            del p[order_id]
-            _bonus_save_pending(p)
-
-def _bonus_extract_hours(short_desc: str, pattern: str = None) -> int | None:
-    if not short_desc:
-        return None
-    p = pattern or r"[+➕]\s*(\d+)\s*[Чч]"
-    match = re.search(p, short_desc)
-    if match:
-        return int(match.group(1))
-    return None
-
-def _bonus_add_hours_to_rental(order_id, hours: int):
-    rents = rentals()
-    for key, r in rents.items():
-        if r.get("order_id") == order_id or r.get("order_key") == order_id:
-            rents[key]["expires_at"] = _safe_ts(rents[key].get("expires_at", 0)) + hours * 3600
-            rents[key]["hours"] = rents[key].get("hours", 0) + hours
-            save_rentals(rents)
-            state = warned_state()
-            for s_key in ("warned_12h",):
-                if key in state.get(s_key, []):
-                    state[s_key].remove(key)
-            save_warned(state)
-            logger.info(f"AutoCode bonus: +{hours}ч к аренде {key} ({r.get('buyer')})")
-            return True
-    logger.warning(f"AutoCode bonus: аренда для заказа {order_id} не найдена")
-    return False
-
-_COMPLETED_STATUSES = {"completed", "closed", "done", "выполнен", "закрыт", "завершён"}
-
-def _order_get_review(order):
-    """Extract review from order object. Returns (stars: int|None, has_review: bool)."""
-    # FunPayAPI Review object: order.review with .stars and .text
-    review = getattr(order, "review", None)
-    if review is not None:
-        stars = getattr(review, "stars", None) or getattr(review, "rating", None)
-        return stars, True
-    # Fallback: maybe direct .stars or .rating
-    stars = getattr(order, "stars", None) or getattr(order, "rating", None)
-    if stars is not None:
-        return stars, True
-    # Fallback: boolean flag
-    if getattr(order, "has_review", False):
-        return None, True
-    return None, False
-
-def _order_get_desc(order) -> str | None:
-    """Extract lot description/title for hours parsing."""
-    lot = getattr(order, "lot", None)
-    if lot is not None:
-        desc = (getattr(lot, "short_description", None)
-                or getattr(lot, "shortdesc", None)
-                or getattr(lot, "description", None))
-        if desc:
-            return desc
-    for attr in ("short_description", "item_title", "lot_name", "description"):
-        val = getattr(order, attr, None)
-        if val:
-            return val
-    return None
-
-def _bonus_apply(c, order_id: str, short_desc: str | None,
-                 chat_id=None, chat_name: str = ""):
-    """Apply bonus hours for a reviewed order. Returns True if applied."""
-    settings = app_settings()
-    pattern = settings.get("bonus_hours_pattern", r"[+➕]\s*(\d+)\s*[Чч]")
-    hours = _bonus_extract_hours(short_desc, pattern) if short_desc else None
-    if hours is None:
-        hours = settings.get("bonus_fallback", 0)
-        if hours <= 0:
-            return False
-    applied = _bonus_add_hours_to_rental(order_id, hours)
-    _bonus_mark_processed(order_id)
-    _bonus_remove_pending(order_id)
-    if chat_id and c is not None:
-        notify_text = t("bonus_notify", hours=hours)
-        if not applied:
-            notify_text += "\n(часы будут начислены вручную)"
-        Thread(target=c.send_message, args=(chat_id, notify_text, chat_name), daemon=True).start()
-    logger.info(f"AutoCode bonus applied: order={order_id}, hours={hours}, rental_found={applied}")
-    return True
-
-def _bonus_on_order_status_changed(c: Cardinal, e):
-    settings = app_settings()
-    if not settings.get("bonus_hours_enabled", True):
-        return
-    order = getattr(e, "order", None)
-    if order is None:
-        return
-    status = str(getattr(order, "status", "") or "").lower()
-    if status not in _COMPLETED_STATUSES:
-        return
-    order_id = str(getattr(order, "id", ""))
-    if not order_id:
-        return
-    if _bonus_is_processed(order_id):
-        return
-
-    stars, has_review = _order_get_review(order)
-    short_desc = _order_get_desc(order)
-    chat_id = getattr(order, "chat_id", None)
-    chat_name = getattr(order, "chat_name", "") or ""
-
-    if has_review:
-        # Review exists — check rating
-        if stars is not None and stars < 4:
-            logger.info(f"AutoCode bonus skipped: order={order_id}, stars={stars}")
-            _bonus_mark_processed(order_id)
-            return
-        _bonus_apply(c, order_id, short_desc, chat_id, chat_name)
-    else:
-        # No review yet — save to pending for deferred check
-        _bonus_add_pending(order_id, {
-            "short_desc": short_desc,
-            "chat_id": chat_id,
-            "chat_name": chat_name,
-            "saved_at": time.time(),
-        })
-        logger.info(f"AutoCode bonus pending: order={order_id} (no review yet)")
-        # Schedule a re-check after 2 hours
-        def _deferred_check():
-            if _shutdown_flag["stop"] or _bonus_is_processed(order_id):
-                return
-            pending = _bonus_pending()
-            if order_id not in pending:
-                return
-            # Still no event-based review → check if rental is still active
-            rents = rentals()
-            for k, r in rents.items():
-                if r.get("order_id") == order_id or r.get("order_key") == order_id:
-                    if _safe_ts(r.get("expires_at", 0)) > time.time():
-                        # Rental still active — keep pending
-                        logger.debug(f"AutoCode bonus deferred: order={order_id} still active, re-queued")
-                        return
-            # Rental expired or not found — give bonus anyway (buyer probably left review
-            # and we missed the event, or review came via web)
-            logger.info(f"AutoCode bonus deferred apply: order={order_id}")
-            _bonus_apply(c, order_id, short_desc, chat_id, chat_name)
-
-        t_timer = Timer(2 * 3600, _deferred_check)
-        t_timer.daemon = True
-        t_timer.start()
-
 _lang_cache_mem: dict[str, str] = {}
 _lang_cache_lock = Lock()
 
@@ -691,6 +488,7 @@ def get_buyer_lang(buyer: str, current_text: str = "") -> str:
     return "ru"
 
 L_DEFAULTS = {
+    "loyalty_bonus":    "🎁 Бонус за повторную покупку: +{days} дн!",
     "rental_activated":   "🌸 | Аренда активирована, команды для входа можешь узнать по команде !faq",
     "rental_renewed":     "✅ Аренда продлена на {h}ч!\nНовое время окончания: {t}",
     "code_msg":           "🔑 Ваш код: {code}\n📅 Получен: {dt}",
@@ -713,7 +511,6 @@ L_DEFAULTS = {
     "extend_link":        "🔄 Для продления оформите новый заказ по ссылке:\nhttps://funpay.com/lots/offer?id={lot_id}",
     "extend_no_rental":   "❌ У вас нет активной аренды для продления.",
     "order_confirm":      "✅ Если всё работает — пожалуйста, подтвердите заказ:\nhttps://funpay.com/orders/{order_id}/",
-    "bonus_notify":       "🎁 Бонус +{hours}Ч за отзыв! Спасибо!",
 }
 
 # Editable text keys shown in TG settings (display_name → L_DEFAULTS key)
@@ -735,7 +532,6 @@ _EDITABLE_TEXTS = {
     "Ссылка продления":      "extend_link",
     "Нет аренды (продл.)":   "extend_no_rental",
     "Подтвержд. заказа":     "order_confirm",
-    "Бонус за отзыв":        "bonus_notify",
 }
 
 def t(key: str, **kwargs) -> str:
@@ -1028,7 +824,6 @@ def get_expiring_rentals(within_hours: float) -> list:
 _code_requests: dict[str, list[float]] = {}
 _last_code_ts:  dict[str, float]       = {}
 _rate_lock = Lock()
-_winback_lock = Lock()
 _used_lock = Lock()
 _rentals_lock = Lock()
 
@@ -1066,7 +861,6 @@ def kb_main():
          B("📢 Рассылка",        callback_data=AC_BROADCAST)],
         [B("🩺 Проверка почт",   callback_data=AC_HEALTH),
          B("⚙️ Настройки",       callback_data=AC_REVIEW)],
-        [B("🔄 Возврат клиентов", callback_data=AC_WINBACK)],
     ])
 
 def kb_stats_period():
@@ -1637,71 +1431,7 @@ def _expiry_watcher(cardinal):
         except Exception as e:
             logger.error(f"Expiry watcher error: {e}")
 
-def _winback_worker(cardinal):
-    time.sleep(120)
-    while not _shutdown_flag["stop"]:
-        try:
-            with _winback_lock:
-                settings = app_settings()
-                if settings.get("winback_enabled", True):
-                    entries = log_entries()
-                    now = time.time()
-                    last_by_buyer = {}
-                    for e in entries:
-                        b = e.get("buyer")
-                        if not b:
-                            continue
-                        ts = _safe_ts(e.get("time", 0))
-                        cid = e.get("chat_id")
-                        if b not in last_by_buyer or ts > last_by_buyer[b][0]:
-                            last_by_buyer[b] = (ts, cid)
 
-                    active_buyers = {r.get("buyer") for r in get_active_rentals()}
-                    sent_log = winback_sent()
-                    new_sends = 0
-
-                    for buyer, (last_ts, cid) in last_by_buyer.items():
-                        if _shutdown_flag["stop"]:
-                            break
-                        if buyer in active_buyers:
-                            continue
-                        days_ago = (now - last_ts) / 86400
-                        if days_ago < WINBACK_AFTER_DAYS or days_ago > WINBACK_MAX_DAYS:
-                            continue
-                        if buyer in sent_log:
-                            continue
-                        if not cid:
-                            for r in rentals().values():
-                                if r.get("buyer") == buyer and r.get("chat_id"):
-                                    cid = r["chat_id"]
-                                    break
-                        if not cid:
-                            continue
-
-                        tpl = settings.get("winback_template", "")
-                        ok, _ = _send_with_retry(cardinal, cid, tpl, buyer)
-                        if ok:
-                            sent_log[buyer] = {
-                                "sent_at": now,
-                                "chat_id": cid,
-                                "last_rental_ts": last_ts,
-                            }
-                            new_sends += 1
-                            logger.info(f"AutoCode winback sent: {buyer}")
-                            time.sleep(BROADCAST_COOLDOWN_SEC)
-
-                    if new_sends:
-                        save_winback(sent_log)
-                        _notify_tg(cardinal,
-                            f"🔄 Возврат клиентов: отправлено {new_sends} сообщений.")
-
-        except Exception as e:
-            logger.error(f"Winback worker error: {e}")
-
-        for _ in range(86400):
-            if _shutdown_flag["stop"]:
-                return
-            time.sleep(1)
 
 def _schedule_review_request(cardinal, chat_id, chat_name, buyer):
     def _send():
@@ -1893,7 +1623,21 @@ def on_new_order(c, e: NewOrderEvent):
             ).start()
             return
 
-    expires_at = now + hours * 3600
+    # ── Loyalty: +LOYALTY_BONUS_DAYS if buyer repurchases within LOYALTY_WINDOW_DAYS ──
+    loyalty_bonus_sec = 0
+    window = LOYALTY_WINDOW_DAYS * 86400
+    for r in rents.values():
+        if r.get("buyer") == buyer:
+            exp = _safe_ts(r.get("expires_at", 0))
+            # Rental expired, but within the loyalty window
+            if exp <= now and (now - exp) <= window:
+                loyalty_bonus_sec = LOYALTY_BONUS_DAYS * 86400
+                logger.info(
+                    f"AutoCode loyalty: {buyer} repurchased within "
+                    f"{LOYALTY_WINDOW_DAYS}d of expiry → +{LOYALTY_BONUS_DAYS}d bonus")
+                break
+
+    expires_at = now + hours * 3600 + loyalty_bonus_sec
     with _rentals_lock:
         rents[order_id] = {
             "order_key":   order_id,
@@ -1920,6 +1664,15 @@ def on_new_order(c, e: NewOrderEvent):
         daemon=True,
     ).start()
 
+    if loyalty_bonus_sec > 0:
+        Thread(
+            target=c.send_message,
+            args=(chat_id,
+                  t("loyalty_bonus", days=LOYALTY_BONUS_DAYS),
+                  chat_name),
+            daemon=True,
+        ).start()
+
     # Schedule order confirmation after first code delivery (5 min)
     # (actual sending happens in _on_result inside on_new_message)
 
@@ -1938,22 +1691,6 @@ def on_new_message(c, e: NewMessageEvent):
     author    = e.message.author       # whoever sent this message
     chat_id   = e.message.chat_id      # the order chat
     chat_name = e.message.chat_name
-
-    # ── Detect review via system/buyer message and apply pending bonus ──
-    msg_type = getattr(e.message, "type", None)
-    is_system = (msg_type == MessageTypes.NON_SYSTEM) is False if msg_type is not None else False
-    review_keywords = ("оставил отзыв", "left a review", "новый отзыв", "отзыв получен", "⭐")
-    if is_system or any(kw in lower for kw in review_keywords):
-        pending = _bonus_pending()
-        for oid, pdata in list(pending.items()):
-            if _bonus_is_processed(oid):
-                _bonus_remove_pending(oid)
-                continue
-            if pdata.get("chat_id") == chat_id:
-                logger.info(f"AutoCode bonus: review detected via message for order={oid}")
-                _bonus_apply(c, oid, pdata.get("short_desc"),
-                             pdata.get("chat_id"), pdata.get("chat_name", ""))
-                break
 
     # ── Find active rental for this chat (by chat_id, not by author) ──
     rents = rentals()
@@ -2141,22 +1878,7 @@ def on_new_message(c, e: NewMessageEvent):
 
     _imap_queue.submit(acc_email, fetch_code, _on_result, acc, used, not_before_ts=not_before_ts)
 
-def _bonus_process_stale_pending(c):
-    """Process any pending bonuses older than 3 hours (review probably left outside of events)."""
-    try:
-        pending = _bonus_pending()
-        now = time.time()
-        for oid, pdata in list(pending.items()):
-            if _bonus_is_processed(oid):
-                _bonus_remove_pending(oid)
-                continue
-            saved_at = pdata.get("saved_at", 0)
-            if now - saved_at > 3 * 3600:
-                logger.info(f"AutoCode bonus: processing stale pending order={oid}")
-                _bonus_apply(c, oid, pdata.get("short_desc"),
-                             pdata.get("chat_id"), pdata.get("chat_name", ""))
-    except Exception as e:
-        logger.warning(f"AutoCode bonus stale scan error: {e}")
+
 
 def init_autocode_tg(cardinal, *args):
     global _cardinal_ref
@@ -2165,8 +1887,6 @@ def init_autocode_tg(cardinal, *args):
 
     _load_lang_cache()
 
-    # Process any stale pending bonuses from before restart
-    Thread(target=_bonus_process_stale_pending, args=(cardinal,), daemon=True).start()
 
     _bcast = {"text": "", "failed": [], "retry_text": "", "scheduled_timer": None}
 
@@ -2860,9 +2580,6 @@ def init_autocode_tg(cardinal, *args):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📝 Запрос отзыва: {'✅ вкл' if s.get('review_enabled', True) else '❌ выкл'}\n"
             f"   {s.get('review_template', '')[:80]}\n\n"
-            f"🔄 Возврат клиентов: {'✅ вкл' if s.get('winback_enabled', True) else '❌ выкл'}\n"
-            f"   Через {WINBACK_AFTER_DAYS}+ дней простоя\n"
-            f"   {s.get('winback_template', '')[:80]}\n\n"
             f"✅ Подтверждение заказа: {'✅ вкл' if s.get('confirm_enabled', True) else '❌ выкл'}\n"
             f"   Через 5 мин после кода\n\n"
             f"📋 FAQ доп. текст: {s.get('faq_custom_ru', '')[:60] or '(пусто)'}"
@@ -2870,8 +2587,6 @@ def init_autocode_tg(cardinal, *args):
         kb = K(keyboard=[
             [B("📝 Вкл/выкл отзывы",      callback_data="ac_rev_toggle"),
              B("✏️ Шаблон отзыва",         callback_data="ac_rev_tpl")],
-            [B("🔄 Вкл/выкл возврат",      callback_data="ac_wb_toggle"),
-             B("✏️ Шаблон возврата",        callback_data=AC_WB_TPL)],
             [B("✅ Вкл/выкл подтверждение", callback_data="ac_confirm_toggle")],
             [B("📋 FAQ доп. текст",         callback_data="ac_faq_tpl_ru")],
             [B("📝 Все тексты сообщений",   callback_data="ac_texts_menu")],
@@ -2899,25 +2614,7 @@ def init_autocode_tg(cardinal, *args):
         save_settings(s)
         bot.send_message(message.chat.id, "✅ Шаблон отзыва сохранён.")
 
-    @bot.callback_query_handler(func=lambda c: c.data == "ac_wb_toggle")
-    def wb_toggle(call: CallbackQuery):
-        s = app_settings()
-        s["winback_enabled"] = not s.get("winback_enabled", True)
-        save_settings(s)
-        _safe_answer(bot, call, f"Возврат: {'вкл' if s['winback_enabled'] else 'выкл'}")
-        open_review(call)
 
-    @bot.callback_query_handler(func=lambda c: c.data == AC_WB_TPL)
-    def wb_tpl(call: CallbackQuery):
-        msg = bot.send_message(call.message.chat.id,
-            f"Текущий шаблон возврата:\n{app_settings().get('winback_template', '')}\n\nВведите новый:")
-        bot.register_next_step_handler(msg, _save_wb_tpl)
-
-    def _save_wb_tpl(message: Message):
-        s = app_settings()
-        s["winback_template"] = message.text.strip()
-        save_settings(s)
-        bot.send_message(message.chat.id, "✅ Шаблон возврата сохранён.")
 
     @bot.callback_query_handler(func=lambda c: c.data == "ac_confirm_toggle")
     def confirm_toggle(call: CallbackQuery):
@@ -3011,50 +2708,6 @@ def init_autocode_tg(cardinal, *args):
         save_settings(s)
         _safe_answer(bot, call, "Все тексты сброшены к стандарту.")
         texts_menu(call)
-
-    @bot.callback_query_handler(func=lambda c: c.data == AC_WINBACK)
-    def open_winback(call: CallbackQuery):
-        sent = winback_sent()
-        entries = log_entries()
-        now = time.time()
-        last_by_buyer = {}
-        for e in entries:
-            b = e.get("buyer")
-            if not b:
-                continue
-            ts = _safe_ts(e.get("time", 0))
-            if b not in last_by_buyer or ts > last_by_buyer[b]:
-                last_by_buyer[b] = ts
-        active_buyers = {r.get("buyer") for r in get_active_rentals()}
-        candidates = []
-        for b, ts in last_by_buyer.items():
-            if b in active_buyers:
-                continue
-            d = (now - ts) / 86400
-            if WINBACK_AFTER_DAYS <= d <= WINBACK_MAX_DAYS and b not in sent:
-                candidates.append((b, d))
-
-        text = (
-            f"🔄 Возврат клиентов\n\n"
-            f"Кандидатов ({WINBACK_AFTER_DAYS}-{WINBACK_MAX_DAYS} дн): <b>{len(candidates)}</b>\n"
-            f"Уже отправлено: <b>{len(sent)}</b>\n\n"
-        )
-        if candidates:
-            text += "Топ-10:\n"
-            for b, d in sorted(candidates, key=lambda x: x[1])[:10]:
-                text += f"  • {b} — {int(d)} дн.\n"
-
-        kb = K(keyboard=[
-            [B(f"📤 Отправить всем ({len(candidates)})", callback_data=AC_WB_RUN)],
-            [B("✏️ Шаблон возврата", callback_data=AC_WB_TPL)],
-            [B("◀ Назад", callback_data=AC_MAIN)],
-        ])
-        _safe_edit(bot, call, text, kb, parse_mode="HTML")
-
-    @bot.callback_query_handler(func=lambda c: c.data == AC_WB_RUN)
-    def wb_run(call: CallbackQuery):
-        _safe_answer(bot, call, "Запущено...")
-        Thread(target=_winback_manual_run, args=(cardinal,), daemon=True).start()
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_BROADCAST)
     def open_broadcast(call: CallbackQuery):
@@ -3322,69 +2975,12 @@ def init_autocode_tg(cardinal, *args):
     Thread(target=_used_code_cleanup_worker,                   daemon=True).start()
     Thread(target=_weekly_report_worker,     args=(cardinal,), daemon=True).start()
     Thread(target=_imap_health_worker,       args=(cardinal,), daemon=True).start()
-    Thread(target=_winback_worker,           args=(cardinal,), daemon=True).start()
     Thread(target=_backup_worker,                              daemon=True).start()
     logger.info(f"AutoCode v{VERSION} инициализирован.")
 
 
-def _winback_manual_run(cardinal):
-    try:
-        with _winback_lock:
-            settings = app_settings()
-            entries = log_entries()
-            now = time.time()
-            last_by_buyer = {}
-            for e in entries:
-                b = e.get("buyer")
-                if not b:
-                    continue
-                ts = _safe_ts(e.get("time", 0))
-                cid = e.get("chat_id")
-                if b not in last_by_buyer or ts > last_by_buyer[b][0]:
-                    last_by_buyer[b] = (ts, cid)
-
-            active_buyers = {r.get("buyer") for r in get_active_rentals()}
-            sent_log = winback_sent()
-            new_sends = 0
-
-            for buyer, (last_ts, cid) in last_by_buyer.items():
-                if _shutdown_flag["stop"]:
-                    break
-                if buyer in active_buyers:
-                    continue
-                days_ago = (now - last_ts) / 86400
-                if days_ago < WINBACK_AFTER_DAYS or days_ago > WINBACK_MAX_DAYS:
-                    continue
-                if buyer in sent_log:
-                    continue
-                if not cid:
-                    for r in rentals().values():
-                        if r.get("buyer") == buyer and r.get("chat_id"):
-                            cid = r["chat_id"]
-                            break
-                if not cid:
-                    continue
-
-                tpl = settings.get("winback_template", "")
-                success, _ = _send_with_retry(cardinal, cid, tpl, buyer)
-                if success:
-                    sent_log[buyer] = {
-                        "sent_at": now,
-                        "chat_id": cid,
-                        "last_rental_ts": last_ts,
-                    }
-                    new_sends += 1
-                    time.sleep(BROADCAST_COOLDOWN_SEC)
-
-            if new_sends:
-                save_winback(sent_log)
-            _notify_tg(cardinal,
-                f"🔄 Win-back завершён. Отправлено: {new_sends}.")
-    except Exception as e:
-        logger.error(f"Manual winback error: {e}")
 
 
-BIND_TO_ORDER_STATUS_CHANGED = [_bonus_on_order_status_changed]
 BIND_TO_PRE_INIT    = [init_autocode_tg]
 BIND_TO_NEW_ORDER   = [on_new_order]
 BIND_TO_NEW_MESSAGE = [on_new_message]

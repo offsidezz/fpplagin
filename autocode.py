@@ -811,7 +811,10 @@ _imap_queue = IMAPQueue()
 
 def get_active_rentals() -> list:
     now = time.time()
-    return [r for r in rentals().values() if _safe_ts(r.get("expires_at", 0)) > now]
+    all_rents = rentals()
+    active = [r for r in all_rents.values() if _safe_ts(r.get("expires_at", 0)) > now]
+    logger.debug(f"AutoCode: get_active_rentals: total={len(all_rents)}, active={len(active)}")
+    return active
 
 def get_expiring_rentals(within_hours: float) -> list:
     now = time.time()
@@ -1199,16 +1202,11 @@ def _startup_sales_scan(cardinal):
                 buyer     = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
                 lot_id    = str(getattr(shortcut, "lot_id", "") or "")
 
-                # FIX: Only use real chat_id — buyer_id/node_id/user_id are
-                # USER IDs, not chat IDs.  Leave None if unavailable;
-                # on_new_message will heal it when the buyer writes.
-                chat_id = None
-                _cid_val = getattr(shortcut, "chat_id", None)
-                if _cid_val:
-                    try:
-                        chat_id = int(_cid_val)
-                    except (TypeError, ValueError):
-                        pass
+                # FIX: chat_id in Cardinal is a string like "users-XXX-YYY",
+                # store as-is (not int).
+                chat_id = getattr(shortcut, "chat_id", None) or None
+                if chat_id:
+                    chat_id = str(chat_id).strip()
 
                 purchase_ts = None
                 if hasattr(shortcut, "date_ts"):
@@ -1266,7 +1264,8 @@ def _startup_sales_scan(cardinal):
                     try:
                         chat = acc_obj.get_chat_by_name(buyer, True)
                         if chat:
-                            chat_id   = chat.id
+                            _cid = chat.id
+                            chat_id   = str(_cid) if _cid else None
                             chat_name = getattr(chat, "name", buyer)
                     except Exception:
                         pass
@@ -1302,29 +1301,28 @@ def _startup_sales_scan(cardinal):
         if restored > 0:
             save_rentals(rents)
 
+        # Count total active rentals in file (including previously saved)
+        active_now = [r for r in rents.values()
+                      if _safe_ts(r.get("expires_at", 0)) > now]
+        active_count = len(active_now)
+
         diag = (
             f"AutoCode: сканирование завершено. "
             f"Восстановлено: {restored} (без chat_id: {no_chat}), пропущено: {skipped} "
             f"[нет часов: {skip_no_hours}, нет акк: {skip_no_acc}, "
-            f"истёк: {skip_expired}, уже есть: {skip_existing}, нет даты: {skip_no_purchase}]."
+            f"истёк: {skip_expired}, уже есть: {skip_existing}, нет даты: {skip_no_purchase}]. "
+            f"Всего в файле: {len(rents)}, из них активных: {active_count}."
         )
         logger.info(diag)
 
-        if restored > 0:
-            extra = f"\n⚠️ Без chat_id: {no_chat}" if no_chat else ""
-            _notify_tg(cardinal,
-                f"✅ AutoCode: восстановлено {restored} активных аренд "
-                f"из истории продаж за 30 дней.{extra}"
-            )
-        elif skip_no_hours > 0:
-            _notify_tg(cardinal,
-                f"⚠️ AutoCode: 0 аренд восстановлено.\n"
-                f"Причина: в названиях лотов не найдены часы/дни.\n"
-                f"Проверено: {len(all_shortcuts)} заказов.\n"
-                f"Без часов: {skip_no_hours}\n"
-                f"Без аккаунта: {skip_no_acc}\n"
-                f"Уже истёк: {skip_expired}"
-            )
+        # Always notify with active count
+        extra = f"\n⚠️ Без chat_id: {no_chat}" if no_chat else ""
+        _notify_tg(cardinal,
+            f"📊 AutoCode: сканирование продаж за 30 дней.\n"
+            f"Новых восстановлено: {restored}\n"
+            f"🏠 Активных аренд: {active_count}\n"
+            f"В файле всего: {len(rents)}{extra}"
+        )
 
     except Exception as e:
         logger.error(f"AutoCode: ошибка сканирования продаж: {e}")
@@ -1633,10 +1631,9 @@ def on_new_order(c, e: NewOrderEvent):
         return
 
     buyer     = getattr(e.order, "buyer_username", "") or ""
-    # FIX: Only use real chat_id — buyer_id is a USER ID, not a chat ID.
-    # If chat_id is unavailable, leave None; on_new_message will set it
-    # when the buyer first writes in the order chat.
-    chat_id   = getattr(e.order, "chat_id", None) or None
+    # FIX: chat_id is a string like "users-XXX-YYY", store as-is
+    _raw_cid  = getattr(e.order, "chat_id", None)
+    chat_id   = str(_raw_cid).strip() if _raw_cid else None
     chat_name = getattr(e.order, "chat_name", "") or buyer
     order_id  = str(getattr(e.order, "id", uuid_lib.uuid4()))
     lot_id    = str(getattr(e.order, "lot_id", ""))

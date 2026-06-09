@@ -877,9 +877,9 @@ def fetch_code(acc, used, not_before_ts=None, dry_run=False) -> tuple[str | None
         if not msg_ids:
             return None, "Входящих писем нет."
 
+        # FIX: Strict max_age_min window — only look at recent emails.
+        # Previously widened by not_before_ts which made max_age meaningless.
         cutoff = time.time() - max_age * 60
-        if not_before_ts:
-            cutoff = min(cutoff, _safe_ts(not_before_ts) - PRE_WINDOW)
 
         for mid in reversed(msg_ids[-50:]):
             try:
@@ -1375,15 +1375,16 @@ def _startup_sales_scan(cardinal):
                 buyer     = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
                 lot_id    = str(getattr(shortcut, "lot_id", "") or "")
 
+                # FIX: Only use real chat_id — buyer_id/node_id/user_id are
+                # USER IDs, not chat IDs.  Leave None if unavailable;
+                # on_new_message will heal it when the buyer writes.
                 chat_id = None
-                for attr in ("chat_id", "buyer_id", "node_id", "user_id"):
-                    val = getattr(shortcut, attr, None)
-                    if val:
-                        try:
-                            chat_id = int(val)
-                            break
-                        except (TypeError, ValueError):
-                            pass
+                _cid_val = getattr(shortcut, "chat_id", None)
+                if _cid_val:
+                    try:
+                        chat_id = int(_cid_val)
+                    except (TypeError, ValueError):
+                        pass
 
                 purchase_ts = None
                 if hasattr(shortcut, "date_ts"):
@@ -1838,11 +1839,15 @@ def on_new_order(c, e: NewOrderEvent):
     lot_name = getattr(e.order, "lot_name", "") or desc
     hours    = _parse_hours(lot_name) or _parse_hours(desc)
     if not hours:
-        logger.debug(f"AutoCode: не удалось определить часы: {lot_name!r}")
+        logger.warning(f"AutoCode: ⚠️ не удалось определить часы из названия лота: {lot_name!r} / {desc!r}. "
+                       f"Аренда НЕ создана. Добавьте длительность в название (напр. '24ч', '30 дней').")
         return
 
     buyer     = getattr(e.order, "buyer_username", "") or ""
-    chat_id   = getattr(e.order, "chat_id", None) or getattr(e.order, "buyer_id", None)
+    # FIX: Only use real chat_id — buyer_id is a USER ID, not a chat ID.
+    # If chat_id is unavailable, leave None; on_new_message will set it
+    # when the buyer first writes in the order chat.
+    chat_id   = getattr(e.order, "chat_id", None) or None
     chat_name = getattr(e.order, "chat_name", "") or buyer
     order_id  = str(getattr(e.order, "id", uuid_lib.uuid4()))
     lot_id    = str(getattr(e.order, "lot_id", ""))
@@ -1955,14 +1960,40 @@ def on_new_message(c, e: NewMessageEvent):
     now = time.time()
 
     def _find_active_rentals_for_chat():
-        """Find active rentals matching this chat_id (any participant)."""
-        return sorted(
-            [r for r in rents.values()
-             if r.get("chat_id") == chat_id
-             and _safe_ts(r.get("expires_at", 0)) > now],
-            key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
-            reverse=True,
-        )
+        """Find active rentals matching this chat_id (any participant).
+        Falls back to buyer-name match and heals chat_id if needed."""
+        # 1. Exact chat_id match
+        results = [r for r in rents.values()
+                   if r.get("chat_id") == chat_id
+                   and _safe_ts(r.get("expires_at", 0)) > now]
+        if results:
+            return sorted(results,
+                          key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
+                          reverse=True)
+
+        # 2. Fallback: match by buyer name, heal the most recent
+        #    unmatched rental only (to avoid clobbering other chats).
+        candidates = [
+            (k, r) for k, r in rents.items()
+            if r.get("buyer") == author
+            and _safe_ts(r.get("expires_at", 0)) > now
+            and r.get("chat_id") != chat_id
+        ]
+        if candidates:
+            # Prefer rentals with no chat_id (=None), then most recent
+            candidates.sort(
+                key=lambda x: (0 if not x[1].get("chat_id") else 1,
+                               -_safe_ts(x[1].get("purchase_ts", 0))))
+            k, r = candidates[0]
+            old_cid = r.get("chat_id")
+            rents[k]["chat_id"]   = chat_id
+            rents[k]["chat_name"] = chat_name
+            save_rentals(rents)
+            logger.info(f"AutoCode: healed chat_id for rental {k} "
+                        f"(buyer={author}, {old_cid} → {chat_id})")
+            return [rents[k]]
+
+        return []
 
     # Update chat_id on rentals by buyer name if not set
     rents_changed = False

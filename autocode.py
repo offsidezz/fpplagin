@@ -35,7 +35,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.5.0"
+VERSION = "5.6.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
@@ -386,6 +386,32 @@ def _buyer_id_from_chat(raw, seller_id=None) -> str | None:
             return a
         return b  # fallback: trailing segment is usually the buyer
     return s  # already a plain user-id
+
+
+def _stack_b2(orders):
+    """Stack a buyer's rental orders into one window (model B2).
+
+    B2 = sequential extension: orders are applied in chronological order and
+    each one extends the window from the LATER of (current expiry, its own
+    purchase moment). Nothing is ever lost — if a window expires before the
+    next purchase, that purchase simply restarts the clock from its own moment;
+    if purchases overlap, their durations add up. Returns
+    ``(earliest_purchase_ts, total_hours, expires_at, order_ids)``.
+    """
+    orders = sorted(orders, key=lambda o: _safe_ts(o.get("purchase_ts", 0)))
+    exp         = 0.0
+    total_hours = 0
+    order_ids   = []
+    for o in orders:
+        pts   = _safe_ts(o.get("purchase_ts", 0))
+        hours = int(o.get("hours", 0) or 0)
+        exp = max(exp, pts) + hours * 3600
+        total_hours += hours
+        oid = o.get("order_id")
+        if oid:
+            order_ids.append(str(oid))
+    earliest = _safe_ts(orders[0].get("purchase_ts", 0)) if orders else 0.0
+    return earliest, total_hours, exp, order_ids
 
 
 def _safe_ts(value) -> float:
@@ -1246,9 +1272,9 @@ def _startup_sales_scan(cardinal):
             logger.warning("AutoCode: get_sales недоступен в текущей версии Cardinal")
             return
         now     = time.time()
-        cutoff  = now - 30 * 24 * 3600
+        cutoff  = now - 31 * 24 * 3600
 
-        logger.info("AutoCode: сканирование продаж за 30 дней...")
+        logger.info("AutoCode: сканирование продаж за 31 день...")
 
         all_shortcuts = []
         start_from    = None
@@ -1295,7 +1321,7 @@ def _startup_sales_scan(cardinal):
                 logger.warning(f"AutoCode: ошибка при получении страницы продаж: {e}")
                 break
 
-        logger.info(f"AutoCode: получено {len(all_shortcuts)} заказов за 30 дней.")
+        logger.info(f"AutoCode: получено {len(all_shortcuts)} заказов за 31 день.")
 
         if not all_shortcuts:
             return
@@ -1303,6 +1329,8 @@ def _startup_sales_scan(cardinal):
         rents    = rentals()
         accs     = accounts()
         restored = 0
+        created  = 0
+        updated  = 0
         skipped  = 0
         skip_no_hours    = 0
         skip_no_acc      = 0
@@ -1310,8 +1338,6 @@ def _startup_sales_scan(cardinal):
         skip_existing    = 0
         skip_no_purchase = 0
         no_chat  = 0
-
-        existing_order_ids = {str(r.get("order_id")) for r in rents.values() if r.get("order_id")}
 
         # Log first shortcut's attributes to help debug lot_name detection
         if all_shortcuts:
@@ -1321,25 +1347,27 @@ def _startup_sales_scan(cardinal):
                          if not k.startswith("_") and isinstance(getattr(s0, k, None), str)}
             logger.info(f"AutoCode: shortcut attrs sample: {attr_dump}")
 
+        seller_id = getattr(acc_obj, "id", None)
+
+        # ── Phase 1: extract normalized rental orders within the window ──
+        orders = []
         for shortcut in all_shortcuts:
             try:
-                order_id  = str(getattr(shortcut, "id", "") or getattr(shortcut, "order_id", ""))
+                order_id = str(getattr(shortcut, "id", "") or getattr(shortcut, "order_id", ""))
 
-                # Try multiple attributes to find lot title with duration
+                # Try multiple attributes to find the lot title carrying duration
                 _lot_candidates = []
                 for _attr in ("description", "lot_name", "title", "lot_title",
                               "short_description", "subcategory_name", "name"):
                     _val = getattr(shortcut, _attr, None)
                     if _val and isinstance(_val, str):
                         _lot_candidates.append(_val)
-                # Also try str(shortcut) as last resort
                 try:
                     _str_val = str(shortcut)
                     if _str_val and len(_str_val) > 5:
                         _lot_candidates.append(_str_val)
                 except Exception:
                     pass
-
                 lot_name = ""
                 for _cand in _lot_candidates:
                     if _parse_hours(_cand):
@@ -1348,18 +1376,11 @@ def _startup_sales_scan(cardinal):
                 if not lot_name:
                     lot_name = _lot_candidates[0] if _lot_candidates else ""
 
-                buyer     = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
-                lot_id    = str(getattr(shortcut, "lot_id", "") or "")
-
-                # NOTE: shortcut.chat_id is a composite "users-{A}-{B}" string,
-                # NOT a real chat_id (~264M) usable for send/match. Extract the
-                # buyer's user-id (= author_id of the buyer's messages) for
-                # robust matching, and leave chat_id None — it is healed on the
-                # buyer's first message and repaired before any outbound send.
+                buyer  = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
+                lot_id = str(getattr(shortcut, "lot_id", "") or "")
                 _raw_bid = (getattr(shortcut, "buyer_id", None)
                             or getattr(shortcut, "chat_id", None))
-                buyer_id = _buyer_id_from_chat(_raw_bid, getattr(acc_obj, "id", None))
-                chat_id  = None
+                buyer_id = _buyer_id_from_chat(_raw_bid, seller_id)
 
                 purchase_ts = None
                 if hasattr(shortcut, "date_ts"):
@@ -1369,19 +1390,12 @@ def _startup_sales_scan(cardinal):
                         purchase_ts = shortcut.date.timestamp()
                     except Exception:
                         pass
-
                 if not purchase_ts:
                     skipped += 1
                     skip_no_purchase += 1
                     continue
-
                 if purchase_ts < cutoff:
                     skipped += 1
-                    continue
-
-                if order_id and order_id in existing_order_ids:
-                    skipped += 1
-                    skip_existing += 1
                     continue
 
                 hours = _parse_hours(lot_name)
@@ -1394,59 +1408,102 @@ def _startup_sales_scan(cardinal):
                             f"lot_name={lot_name!r:.120}, order_id={order_id}")
                     continue
 
-                expires_at = purchase_ts + hours * 3600
-
-                if expires_at <= now:
-                    skipped += 1
-                    skip_expired += 1
-                    continue
-
                 acc_email = None
                 for a in accs:
                     if lot_id in a.get("lot_ids", []) or not a.get("lot_ids"):
                         acc_email = a["email"]
                         break
-
                 if not acc_email:
                     skipped += 1
                     skip_no_acc += 1
                     continue
 
-                chat_name = buyer
-                # chat_id is resolved lazily (heal on first buyer message /
-                # repair before outbound) to avoid hammering get_chat_by_name
-                # for every restored order during the bulk scan.
-                if not chat_id:
-                    no_chat += 1
-
-                key = order_id or str(uuid_lib.uuid4())
-                rents[key] = {
-                    "order_key":   key,
-                    "buyer":       buyer,
-                    "buyer_id":    buyer_id,
-                    "chat_id":     chat_id,
-                    "chat_name":   chat_name,
-                    "email":       acc_email,
-                    "lot_id":      lot_id,
-                    "order_id":    order_id,
-                    "purchase_ts": purchase_ts,
-                    "expires_at":  expires_at,
-                    "hours":       hours,
-                    "restored":    True,
-                    "lang":        "ru",
-                }
-                existing_order_ids.add(order_id)
-                restored += 1
-
-                if restored % 50 == 0:
-                    save_rentals(rents)
-
+                orders.append({
+                    "order_id": order_id, "buyer": buyer, "buyer_id": buyer_id,
+                    "lot_id": lot_id, "email": acc_email,
+                    "purchase_ts": purchase_ts, "hours": hours,
+                })
             except Exception as e:
                 logger.warning(f"AutoCode: ошибка обработки заказа: {e}")
                 continue
 
-        if restored > 0:
-            save_rentals(rents)
+        # ── Phase 2: group by (buyer, email), stack durations (B2) and
+        #    reconcile against existing rentals (backfill buyer_id, repair
+        #    chat_id, merge duplicate per-order rentals, never shorten). ──
+        groups = {}
+        for o in orders:
+            groups.setdefault((_name_norm(o["buyer"]), o["email"]), []).append(o)
+
+        existing_by_group = {}
+        for k, r in rents.items():
+            existing_by_group.setdefault(
+                (_name_norm(r.get("buyer")), r.get("email")), []).append(k)
+
+        for gkey, glist in groups.items():
+            glist.sort(key=lambda o: o["purchase_ts"])
+            earliest, total_hours, computed_exp, order_ids = _stack_b2(glist)
+            buyer_disp = glist[-1]["buyer"] or glist[0]["buyer"]
+            buyer_id   = next((o["buyer_id"] for o in reversed(glist) if o["buyer_id"]), None)
+            email      = gkey[1]
+            lot_id     = glist[-1]["lot_id"]
+
+            ex_keys = existing_by_group.get(gkey, [])
+            if ex_keys:
+                keep = ex_keys[0]
+                r = rents[keep]
+                # Never shorten: keep the longer of stored (maybe manually
+                # extended) and the recomputed stacked expiry.
+                r["expires_at"] = max(_safe_ts(r.get("expires_at", 0)), computed_exp)
+                if buyer_id and not r.get("buyer_id"):
+                    r["buyer_id"] = buyer_id
+                # Repair a chat_id that is actually the buyer's user-id or a
+                # composite "users-..." string so it re-heals cleanly.
+                _ex_cid = r.get("chat_id")
+                if (isinstance(_ex_cid, str) and _ex_cid.startswith("users-")) or \
+                   (_ex_cid is not None and buyer_id and _cid_norm(_ex_cid) == _bid_norm(buyer_id)):
+                    r["chat_id"] = None
+                merged_ids = set(order_ids)
+                if r.get("order_id"):
+                    merged_ids.add(str(r.get("order_id")))
+                merged_ids.update(str(x) for x in r.get("order_ids", []))
+                r["order_ids"]   = sorted(i for i in merged_ids if i)
+                r["hours"]       = max(int(r.get("hours", 0) or 0), total_hours)
+                r["purchase_ts"] = min(_safe_ts(r.get("purchase_ts", 0)) or earliest, earliest)
+                rents[keep] = r
+                # Collapse duplicate per-order rentals for this buyer+email.
+                for dup in ex_keys[1:]:
+                    rents.pop(dup, None)
+                    skip_existing += 1
+                updated += 1
+                if not r.get("chat_id"):
+                    no_chat += 1
+            else:
+                if computed_exp <= now:
+                    skipped += 1
+                    skip_expired += 1
+                    continue
+                key = order_ids[0] if order_ids else str(uuid_lib.uuid4())
+                rents[key] = {
+                    "order_key":   key,
+                    "buyer":       buyer_disp,
+                    "buyer_id":    buyer_id,
+                    "chat_id":     None,
+                    "chat_name":   buyer_disp,
+                    "email":       email,
+                    "lot_id":      lot_id,
+                    "order_id":    order_ids[0] if order_ids else key,
+                    "order_ids":   order_ids,
+                    "purchase_ts": earliest,
+                    "expires_at":  computed_exp,
+                    "hours":       total_hours,
+                    "restored":    True,
+                    "lang":        "ru",
+                }
+                created += 1
+                no_chat += 1
+
+        restored = created + updated
+        save_rentals(rents)
 
         # Count total active rentals in file (including previously saved)
         active_now = [r for r in rents.values()
@@ -1455,9 +1512,9 @@ def _startup_sales_scan(cardinal):
 
         diag = (
             f"AutoCode: сканирование завершено. "
-            f"Восстановлено: {restored} (без chat_id: {no_chat}), пропущено: {skipped} "
+            f"Создано: {created}, обновлено: {updated} (без chat_id: {no_chat}), пропущено: {skipped} "
             f"[нет часов: {skip_no_hours}, нет акк: {skip_no_acc}, "
-            f"истёк: {skip_expired}, уже есть: {skip_existing}, нет даты: {skip_no_purchase}]. "
+            f"истёк: {skip_expired}, дублей слито: {skip_existing}, нет даты: {skip_no_purchase}]. "
             f"Всего в файле: {len(rents)}, из них активных: {active_count}."
         )
         logger.info(diag)
@@ -1465,8 +1522,8 @@ def _startup_sales_scan(cardinal):
         # Always notify with active count
         extra = f"\n⚠️ Без chat_id: {no_chat}" if no_chat else ""
         _notify_tg(cardinal,
-            f"📊 AutoCode: сканирование продаж за 30 дней.\n"
-            f"Новых восстановлено: {restored}\n"
+            f"📊 AutoCode: сканирование продаж за 31 день.\n"
+            f"Новых аренд: {created}, обновлено: {updated}\n"
             f"🏠 Активных аренд: {active_count}\n"
             f"В файле всего: {len(rents)}{extra}"
         )

@@ -312,3 +312,130 @@ def test_safe_edit_defaults_to_plain_text():
     ac._safe_edit(_Bot(), call, "🟢 >24ч 🔴 <2ч", kb=None)
     # plain text → no HTML parsing of the literal '<2ч'
     assert captured["parse_mode"] == ""
+
+
+# ───────── B2 stacking of multiple purchases ─────────
+
+def test_stack_b2_single_order():
+    o = [{"order_id": "A", "purchase_ts": 1000.0, "hours": 24}]
+    earliest, total, exp, ids = ac._stack_b2(o)
+    assert earliest == 1000.0
+    assert total == 24
+    assert exp == 1000.0 + 24 * 3600
+    assert ids == ["A"]
+
+
+def test_stack_b2_overlapping_adds_up():
+    # Two purchases close together → durations add up (sequential extension).
+    o = [
+        {"order_id": "A", "purchase_ts": 1000.0, "hours": 24},
+        {"order_id": "B", "purchase_ts": 2000.0, "hours": 24},
+    ]
+    earliest, total, exp, ids = ac._stack_b2(o)
+    assert total == 48
+    # second extends from first's expiry (1000+24h) not from its own purchase
+    assert exp == 1000.0 + 48 * 3600
+    assert ids == ["A", "B"]
+
+
+def test_stack_b2_gap_restarts_from_purchase():
+    # First window long-expired before the second purchase → restart from it.
+    base = 1_000_000.0
+    o = [
+        {"order_id": "A", "purchase_ts": base, "hours": 24},
+        {"order_id": "B", "purchase_ts": base + 100 * 3600, "hours": 24},
+    ]
+    earliest, total, exp, ids = ac._stack_b2(o)
+    assert earliest == base
+    assert total == 48
+    # second purchase is after the first expired → expiry = its purchase + 24h
+    assert exp == (base + 100 * 3600) + 24 * 3600
+
+
+def test_stack_b2_unsorted_input():
+    o = [
+        {"order_id": "B", "purchase_ts": 2000.0, "hours": 10},
+        {"order_id": "A", "purchase_ts": 1000.0, "hours": 10},
+    ]
+    earliest, total, exp, ids = ac._stack_b2(o)
+    assert earliest == 1000.0
+    assert ids == ["A", "B"]
+
+
+# ───────── restore scan: reconcile + stack (startup) ─────────
+
+def _make_shortcut(order_id, buyer, seller_buyer_chat, lot_name, lot_id, date_ts):
+    return _types.SimpleNamespace(
+        id=order_id, buyer_username=buyer, chat_id=seller_buyer_chat,
+        description=lot_name, lot_id=lot_id, date_ts=date_ts)
+
+
+def _make_scan_cardinal(shortcuts, seller_id=7028500):
+    pages = [shortcuts, []]
+
+    def get_sales(start_from=None, **k):
+        idx = 0 if start_from is None else 1
+        page = pages[idx] if idx < len(pages) else []
+        nxt = "next" if idx == 0 and page else None
+        return (nxt, page)
+
+    account = _types.SimpleNamespace(id=seller_id, get_sales=get_sales)
+    return _types.SimpleNamespace(account=account)
+
+
+def test_restore_scan_stacks_and_backfills(monkeypatch):
+    monkeypatch.setattr(ac.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "_notify_tg", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "accounts", lambda: [{"email": "m@x.ru", "lot_ids": []}])
+    ac.save_rentals({})
+    monkeypatch.setattr(ac, "_shutdown_flag", {"stop": False}, raising=False)
+
+    now = ac.time.time()
+    # Two recent purchases by the same buyer for the same account → stack to 48h
+    lot = "NETFLIX Premium 30 ДНЕЙ / 720ч • +12ч ЗА ОТЗЫВ"
+    s1 = _make_shortcut("O1", "Dima548", "users-7028500-16710870",
+                        "Netflix 1 ДЕНЬ / 24ч", "111", now - 2 * 3600)
+    s2 = _make_shortcut("O2", "Dima548", "users-7028500-16710870",
+                        "Netflix 1 ДЕНЬ / 24ч", "111", now - 1 * 3600)
+    c = _make_scan_cardinal([s1, s2])
+    ac._startup_sales_scan(c)
+
+    rents = ac.rentals()
+    assert len(rents) == 1, rents
+    r = list(rents.values())[0]
+    assert r["buyer"] == "Dima548"
+    assert ac._bid_norm(r["buyer_id"]) == "16710870"   # extracted from composite
+    assert r["chat_id"] is None                          # resolved lazily
+    assert r["hours"] == 48                              # stacked
+    assert set(r["order_ids"]) == {"O1", "O2"}
+
+
+def test_restore_scan_merges_existing_and_never_shortens(monkeypatch):
+    monkeypatch.setattr(ac.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "_notify_tg", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "accounts", lambda: [{"email": "m@x.ru", "lot_ids": []}])
+    monkeypatch.setattr(ac, "_shutdown_flag", {"stop": False}, raising=False)
+
+    now = ac.time.time()
+    # Pre-existing rental from the buggy era: wrong chat_id (= buyer user-id),
+    # no buyer_id, and a manually extended (far-future) expiry.
+    manual_exp = now + 1000 * 3600
+    ac.save_rentals({"O1": {
+        "order_key": "O1", "buyer": "Dima548", "buyer_id": None,
+        "chat_id": "16710870", "chat_name": "Dima548", "email": "m@x.ru",
+        "lot_id": "111", "order_id": "O1",
+        "purchase_ts": now - 2 * 3600, "expires_at": manual_exp,
+        "hours": 24, "lang": "ru",
+    }})
+
+    s1 = _make_shortcut("O1", "Dima548", "users-7028500-16710870",
+                        "Netflix 1 ДЕНЬ / 24ч", "111", now - 2 * 3600)
+    c = _make_scan_cardinal([s1])
+    ac._startup_sales_scan(c)
+
+    rents = ac.rentals()
+    assert len(rents) == 1
+    r = rents["O1"]
+    assert ac._bid_norm(r["buyer_id"]) == "16710870"   # backfilled
+    assert r["chat_id"] is None                          # broken user-id cleared
+    assert r["expires_at"] == manual_exp                 # never shortened

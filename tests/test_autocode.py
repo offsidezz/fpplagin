@@ -143,3 +143,18 @@ def test_fetch_code_skips_already_used_via_fresh_read(monkeypatch):
     # Caller passes a STALE snapshot that does not contain the code
     code, err = ac.fetch_code(acc, used={})
     assert code is None  # must not double-deliver
+
+
+# ───────────────────────── chat_id normalization (no-active-rental bug) ─────
+
+def test_cid_norm_unifies_str_and_int():
+    # Restored rentals store chat_id as str; e.message.chat_id is int.
+    assert ac._cid_norm("12345") == ac._cid_norm(12345)
+    assert ac._cid_norm(None) is None
+    assert ac._cid_norm("") is None
+    assert ac._cid_norm("  users-1-2  ") == "users-1-2"
+
+
+def test_name_norm_tolerant_match():
+    assert ac._name_norm(" Offsidez ") == ac._name_norm("offsidez")
+    assert ac._name_norm(None) == ""

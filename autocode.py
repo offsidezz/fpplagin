@@ -360,6 +360,34 @@ def _bid_norm(value) -> str | None:
     return s or None
 
 
+def _buyer_id_from_chat(raw, seller_id=None) -> str | None:
+    """Extract the *buyer's* numeric user-id from a chat identifier.
+
+    FunPay exposes chat identifiers as a composite string
+    ``users-{A}-{B}`` where one of A/B is the seller's user-id and the other
+    is the buyer's. The seller can be in *either* position
+    (e.g. ``users-7028500-16710870`` and ``users-3223981-7028500``), so we
+    pick the segment that is NOT the seller. The buyer user-id equals the
+    author_id of the buyer's incoming messages, which makes it a robust
+    matching key. A plain numeric id is returned as-is.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    m = re.match(r"^users-(\d+)-(\d+)$", s)
+    if m:
+        a, b = m.group(1), m.group(2)
+        sid = _bid_norm(seller_id)
+        if sid and a == sid:
+            return b
+        if sid and b == sid:
+            return a
+        return b  # fallback: trailing segment is usually the buyer
+    return s  # already a plain user-id
+
+
 def _safe_ts(value) -> float:
     if value is None:
         return 0.0
@@ -1026,7 +1054,12 @@ def _notify_tg_rate_limit(cardinal, buyer, count):
     _notify_tg(cardinal,
         f"🚨 Лимит запросов\nПокупатель {buyer} сделал {count} запросов за час.")
 
-def _safe_edit(bot, call, text, kb, parse_mode=None):
+def _safe_edit(bot, call, text, kb, parse_mode=""):
+    # parse_mode="" (not None): telebot treats None as "use the bot's default
+    # parse_mode", and the host bot defaults to HTML. That made plain-text panels
+    # containing literal "<"/">" (e.g. the legend "🔴 <2ч") fail with
+    # "can't parse entities: Unsupported start tag". An empty string forces
+    # plain text. Callers that genuinely need HTML pass parse_mode="HTML".
     try:
         bot.edit_message_text(
             text,
@@ -1318,15 +1351,14 @@ def _startup_sales_scan(cardinal):
                 buyer     = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
                 lot_id    = str(getattr(shortcut, "lot_id", "") or "")
 
-                # NOTE: shortcut.chat_id here is actually the buyer's *user-id*
-                # (a small number ~1-20M), NOT a real chat_id (~264M). Storing
-                # it as chat_id breaks matching AND makes every outbound send
-                # raise "Доступ запрещён". So capture it as buyer_id (used for
-                # robust matching) and leave chat_id None — it is healed on the
+                # NOTE: shortcut.chat_id is a composite "users-{A}-{B}" string,
+                # NOT a real chat_id (~264M) usable for send/match. Extract the
+                # buyer's user-id (= author_id of the buyer's messages) for
+                # robust matching, and leave chat_id None — it is healed on the
                 # buyer's first message and repaired before any outbound send.
-                buyer_id = (getattr(shortcut, "buyer_id", None)
+                _raw_bid = (getattr(shortcut, "buyer_id", None)
                             or getattr(shortcut, "chat_id", None))
-                buyer_id = str(buyer_id).strip() if buyer_id else None
+                buyer_id = _buyer_id_from_chat(_raw_bid, getattr(acc_obj, "id", None))
                 chat_id  = None
 
                 purchase_ts = None
@@ -1740,13 +1772,13 @@ def on_new_order(c, e: NewOrderEvent):
         return
 
     buyer     = getattr(e.order, "buyer_username", "") or ""
-    # NOTE: e.order.chat_id is frequently None and, when present, is the buyer's
-    # user-id (not a real chat_id ~264M). Capture it as buyer_id for robust
-    # matching and leave chat_id None — it is healed when the buyer first writes
-    # (and repaired before any outbound send). This avoids the "Доступ запрещён"
-    # failures from sending to a user-id.
+    # NOTE: e.order.chat_id is frequently None and, when present, is a composite
+    # "users-{A}-{B}" string (not a real chat_id ~264M). Extract the buyer's
+    # user-id for robust matching and leave chat_id None — it is healed when the
+    # buyer first writes (and repaired before any outbound send). This avoids the
+    # "Доступ запрещён" failures from sending to a non-chat id.
     _raw_bid  = getattr(e.order, "buyer_id", None) or getattr(e.order, "chat_id", None)
-    buyer_id  = str(_raw_bid).strip() if _raw_bid else None
+    buyer_id  = _buyer_id_from_chat(_raw_bid, getattr(getattr(c, "account", None), "id", None))
     chat_id   = None
     chat_name = getattr(e.order, "chat_name", "") or buyer
     order_id  = str(getattr(e.order, "id", uuid_lib.uuid4()))

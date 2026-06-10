@@ -263,3 +263,52 @@ def test_send_to_buyer_returns_false_when_unresolvable(monkeypatch):
     c = _fake_cardinal(name_lookup={}, fail_chat_ids=("55",))
     ok = ac._send_to_buyer(c, dict(rental), "hi")
     assert ok is False
+
+
+# ───────── buyer-id extraction from composite chat string ─────────
+
+def test_buyer_id_from_chat_seller_first():
+    # users-{seller}-{buyer}: seller in front, buyer is the other segment
+    assert ac._buyer_id_from_chat("users-7028500-16710870", 7028500) == "16710870"
+
+
+def test_buyer_id_from_chat_seller_second():
+    # users-{buyer}-{seller}: seller can also be the trailing segment
+    assert ac._buyer_id_from_chat("users-3223981-7028500", 7028500) == "3223981"
+
+
+def test_buyer_id_from_chat_plain_and_empty():
+    assert ac._buyer_id_from_chat("16710870", 7028500) == "16710870"
+    assert ac._buyer_id_from_chat(None, 7028500) is None
+    assert ac._buyer_id_from_chat("  ", 7028500) is None
+
+
+def test_buyer_id_from_chat_matches_author_id_for_matching():
+    # The extracted buyer_id must equal the buyer's author_id so the buyer_id
+    # matching tier in on_new_message works.
+    bid = ac._buyer_id_from_chat("users-7028500-16710870", 7028500)
+    assert ac._bid_norm(bid) == ac._bid_norm(16710870)
+
+
+def test_safe_edit_defaults_to_plain_text():
+    """Regression for the TG 'Unsupported start tag \"2ч\"' crash: the panel
+    legend contains a literal '<2ч' and the host bot defaults to HTML parse
+    mode. _safe_edit must default parse_mode to '' (plain text), not None."""
+    import inspect
+    sig = inspect.signature(ac._safe_edit)
+    assert sig.parameters["parse_mode"].default == ""
+
+    captured = {}
+
+    class _Bot:
+        def edit_message_text(self, text, chat_id, message_id,
+                              reply_markup=None, parse_mode=None):
+            captured["parse_mode"] = parse_mode
+
+    call = _types.SimpleNamespace(
+        message=_types.SimpleNamespace(
+            chat=_types.SimpleNamespace(id=1), message_id=2),
+        id="cb")
+    ac._safe_edit(_Bot(), call, "🟢 >24ч 🔴 <2ч", kb=None)
+    # plain text → no HTML parsing of the literal '<2ч'
+    assert captured["parse_mode"] == ""

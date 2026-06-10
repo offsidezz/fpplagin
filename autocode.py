@@ -22,7 +22,8 @@ from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 import threading
-from threading import Thread, Timer, Lock
+import copy
+from threading import Thread, Timer, Lock, RLock
 
 from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent, OrderStatusChangedEvent
 from FunPayAPI.common.enums import MessageTypes
@@ -35,7 +36,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.7.0"
+VERSION = "5.8.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
@@ -347,6 +348,11 @@ def _name_norm(value) -> str:
     return (value or "").strip().casefold()
 
 
+def _email_key(value) -> str:
+    """Normalize an email for keying/comparison (case-insensitive)."""
+    return (value or "").strip().lower()
+
+
 def _bid_norm(value) -> str | None:
     """Normalize a buyer/author *user-id* to a comparable string.
 
@@ -503,8 +509,63 @@ def save_accs(d):          _save(ACCOUNTS_FILE, d)
 def used_codes():          return _load(USED_FILE, {})
 def save_used(d):          _save(USED_FILE, d)
 def log_entries():         return _load(LOG_FILE, [])
-def rentals():             return _load(RENTALS_FILE, {})
-def save_rentals(d):       _save(RENTALS_FILE, d)
+
+# ── Rentals: in-memory write-back cache ──────────────────────────────────
+# rentals.json is read on (almost) every incoming buyer message and rewritten
+# on every state change. Reading+decrypting the whole file each time is the
+# main hot-path cost. We keep the rentals in memory (single source of truth)
+# and flush dirty state to disk on a short interval + on shutdown. Disk writes
+# stay atomic (see `_save`: temp file + os.replace).
+_rentals_cache: dict | None = None
+_rentals_dirty   = False
+_rentals_cache_lock = RLock()
+RENTALS_FLUSH_INTERVAL = 3.0          # seconds between background flushes
+
+def _rentals_cache_get() -> dict:
+    """Return the live cache dict, loading it from disk on first use."""
+    global _rentals_cache
+    if _rentals_cache is None:
+        _rentals_cache = _load(RENTALS_FILE, {})
+    return _rentals_cache
+
+def rentals():
+    """A detached snapshot of current rentals (safe for callers to mutate)."""
+    with _rentals_cache_lock:
+        return copy.deepcopy(_rentals_cache_get())
+
+def save_rentals(d, immediate: bool = False):
+    """Update the cache; persist on the next flush (or now if immediate)."""
+    global _rentals_cache, _rentals_dirty
+    with _rentals_cache_lock:
+        _rentals_cache = copy.deepcopy(d)
+        _rentals_dirty = True
+    if immediate:
+        _flush_rentals()
+
+def _flush_rentals():
+    """Write the cache to disk if it has unsaved changes."""
+    global _rentals_dirty
+    with _rentals_cache_lock:
+        if not _rentals_dirty or _rentals_cache is None:
+            return
+        data = copy.deepcopy(_rentals_cache)
+        _rentals_dirty = False
+    try:
+        _save(RENTALS_FILE, data)        # atomic (temp + os.replace)
+    except Exception as e:
+        # Persist failed → keep dirty so the next tick retries.
+        with _rentals_cache_lock:
+            _rentals_dirty = True
+        logger.error(f"AutoCode: не удалось сохранить аренды: {e}")
+
+def _rentals_flush_worker():
+    while not _shutdown_flag["stop"]:
+        for _ in range(int(RENTALS_FLUSH_INTERVAL)):
+            if _shutdown_flag["stop"]:
+                break
+            time.sleep(1)
+        _flush_rentals()
+    _flush_rentals()                      # final flush on shutdown
 def templates():           return _load(TEMPLATES_FILE, [])
 def save_templates(d):     _save(TEMPLATES_FILE, d)
 def bcast_history():       return _load(BCAST_HIST_FILE, [])
@@ -1094,7 +1155,7 @@ def _stats_text(entries, label: str) -> str:
     peak = Counter(hours_list).most_common(3)
     peak_str = ", ".join(f"{h:02d}:00 ({c})" for h, c in peak) or "—"
 
-    all_rents     = _load(RENTALS_FILE, {})
+    all_rents     = rentals()
     rent_by_buyer = Counter(r.get("buyer") for r in all_rents.values() if r.get("buyer"))
     top_renters   = "\n".join(
         f"  {i+1}. {b}: {c} аренд"
@@ -1641,6 +1702,42 @@ def _startup_sales_scan(cardinal):
     except Exception as e:
         logger.error(f"AutoCode: ошибка сканирования продаж: {e}")
 
+def _prune_used_codes(now: float | None = None) -> bool:
+    """Drop used-code records that are past the TTL — but only for email
+    accounts whose rental is no longer active. While a rental is active we
+    keep its codes regardless of age, so the same code is never re-issued.
+    Returns True if anything changed."""
+    now = time.time() if now is None else now
+    # Emails that still have at least one ACTIVE (non-expired) rental.
+    active_emails = {
+        _email_key(r.get("email"))
+        for r in rentals().values()
+        if _safe_ts(r.get("expires_at", 0)) > now
+    }
+    active_emails.discard("")
+    with _used_lock:
+        used = used_codes()
+        changed = False
+        for em, entries in used.items():
+            em_active = _email_key(em) in active_emails
+            new_entries = []
+            for entry in entries:
+                if isinstance(entry, dict):
+                    fresh = now - _safe_ts(entry.get("used_at", 0)) < USED_CODE_TTL_SEC
+                    if em_active or fresh:
+                        new_entries.append(entry)        # keep while rental active
+                    else:
+                        changed = True
+                else:
+                    new_entries.append({"code": entry, "used_at": now})
+                    changed = True
+            used[em] = new_entries
+        if changed:
+            save_used(used)
+            logger.info("AutoCode: очистка использованных кодов выполнена.")
+    return changed
+
+
 def _used_code_cleanup_worker():
     while not _shutdown_flag["stop"]:
         for _ in range(3600):
@@ -1648,24 +1745,7 @@ def _used_code_cleanup_worker():
                 return
             time.sleep(1)
         try:
-            now  = time.time()
-            used = used_codes()
-            changed = False
-            for em, entries in used.items():
-                new_entries = []
-                for entry in entries:
-                    if isinstance(entry, dict):
-                        if now - _safe_ts(entry.get("used_at", 0)) < USED_CODE_TTL_SEC:
-                            new_entries.append(entry)
-                        else:
-                            changed = True
-                    else:
-                        new_entries.append({"code": entry, "used_at": now})
-                        changed = True
-                used[em] = new_entries
-            if changed:
-                save_used(used)
-                logger.info("AutoCode: очистка использованных кодов выполнена.")
+            _prune_used_codes()
         except Exception as e:
             logger.error(f"Used-code cleanup error: {e}")
 
@@ -1837,6 +1917,7 @@ def _backup_worker():
             time.sleep(1)
         try:
             _ensure()
+            _flush_rentals()        # ensure rentals.json on disk is current
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
             # FIX: Also backup ACCOUNTS_FILE (credentials)
             for src in (RENTALS_FILE, LOG_FILE, ACCOUNTS_FILE):
@@ -1901,6 +1982,10 @@ def _graceful_shutdown(*args):
     if _shutdown_event.is_set():
         return
     _shutdown_event.set()
+    try:
+        _flush_rentals()          # never lose in-memory rental changes
+    except Exception:
+        pass
     logger.info("AutoCode: graceful shutdown.")
 
 atexit.register(_graceful_shutdown)
@@ -3532,6 +3617,7 @@ def init_autocode_tg(cardinal, *args):
             bot.send_message(message.chat.id,
                 "❌ Неверный формат. Пример: <code>31.05.2026 18:00</code>", parse_mode="HTML")
 
+    Thread(target=_rentals_flush_worker,                       daemon=True).start()
     Thread(target=_expiry_watcher,           args=(cardinal,), daemon=True).start()
     Thread(target=_startup_imap_test,        args=(cardinal,), daemon=True).start()
     Thread(target=_startup_sales_scan,       args=(cardinal,), daemon=True).start()

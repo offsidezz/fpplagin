@@ -578,3 +578,57 @@ def test_restore_scan_subtracts_refund(monkeypatch):
     assert "O2" not in [str(x) for x in r["order_ids"]]
     assert r["hours"] == 24            # 48 - 24 refunded
     assert "O2" in r["refunded_ids"]
+
+
+# ───────── rentals in-memory write-back cache ─────────
+
+def test_rentals_cache_roundtrip_and_flush():
+    now = ac.time.time()
+    data = {"X": {"order_id": "X", "buyer": "Ann", "email": "m@x.ru",
+                  "expires_at": now + 3600, "hours": 1}}
+    ac.save_rentals(data)                 # deferred write → cache only
+    # reads come straight from the in-memory cache
+    assert ac.rentals()["X"]["buyer"] == "Ann"
+    # caller mutating the returned snapshot must NOT corrupt the cache
+    snap = ac.rentals()
+    snap["X"]["buyer"] = "HACKED"
+    assert ac.rentals()["X"]["buyer"] == "Ann"
+    # flush persists to disk
+    ac._flush_rentals()
+    on_disk = ac._load(ac.RENTALS_FILE, {})
+    assert on_disk["X"]["buyer"] == "Ann"
+
+
+def test_save_rentals_immediate_writes_disk():
+    now = ac.time.time()
+    ac.save_rentals({"Y": {"order_id": "Y", "email": "m@x.ru",
+                           "expires_at": now + 3600, "hours": 1}}, immediate=True)
+    assert "Y" in ac._load(ac.RENTALS_FILE, {})
+
+
+# ───────── used-code cleanup keeps codes while rental is active ─────────
+
+def test_prune_used_codes_respects_active_rental():
+    now = ac.time.time()
+    old = now - (ac.USED_CODE_TTL_SEC + 3600)     # well past the TTL
+    # active rental on a@x.ru, expired rental on b@x.ru
+    ac.save_rentals({
+        "R1": {"order_id": "R1", "email": "a@x.ru", "expires_at": now + 10 * 3600},
+        "R2": {"order_id": "R2", "email": "b@x.ru", "expires_at": now - 3600},
+    }, immediate=True)
+    ac.save_used({
+        "a@x.ru": [{"code": "AAA", "used_at": old}],   # old but rental ACTIVE → keep
+        "b@x.ru": [{"code": "BBB", "used_at": old}],   # old + rental expired → drop
+    })
+    ac._prune_used_codes(now=now)
+    u = ac.used_codes()
+    assert [e["code"] for e in u["a@x.ru"]] == ["AAA"]   # kept
+    assert u["b@x.ru"] == []                              # pruned
+
+
+def test_prune_used_codes_keeps_fresh_even_if_inactive():
+    now = ac.time.time()
+    ac.save_rentals({}, immediate=True)                  # no active rentals
+    ac.save_used({"c@x.ru": [{"code": "CCC", "used_at": now - 60}]})  # fresh
+    ac._prune_used_codes(now=now)
+    assert [e["code"] for e in ac.used_codes()["c@x.ru"]] == ["CCC"]

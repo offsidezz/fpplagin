@@ -158,3 +158,108 @@ def test_cid_norm_unifies_str_and_int():
 def test_name_norm_tolerant_match():
     assert ac._name_norm(" Offsidez ") == ac._name_norm("offsidez")
     assert ac._name_norm(None) == ""
+
+
+# ───────── buyer_id matching + chat_id repair (user-id vs chat-id bug) ─────────
+
+import types as _types
+
+
+def _msg_event(text, author, author_id, chat_id, chat_name=None):
+    msg = _types.SimpleNamespace(
+        text=text, author=author, author_id=author_id,
+        chat_id=chat_id, chat_name=chat_name or author)
+    return _types.SimpleNamespace(message=msg)
+
+
+def _fake_cardinal(seller_id=7028500, chat_lookup=None, name_lookup=None,
+                   fail_chat_ids=()):
+    sent = []
+
+    def send_message(cid, text, cname=""):
+        if str(cid) in {str(x) for x in fail_chat_ids}:
+            raise RuntimeError("Доступ запрещен.")
+        sent.append((str(cid), text, cname))
+
+    account = _types.SimpleNamespace(
+        id=seller_id,
+        get_chat=lambda cid: (chat_lookup or {}).get(int(cid) if str(cid).isdigit() else cid),
+        get_chat_by_name=lambda name, *a, **k: (name_lookup or {}).get(name),
+    )
+    c = _types.SimpleNamespace(account=account, send_message=send_message)
+    c._sent = sent
+    return c
+
+
+def _seed_rental(monkeypatch, **over):
+    base = {
+        "order_key": "ORD1", "buyer": "Dima548", "buyer_id": None,
+        "chat_id": None, "chat_name": "Dima548", "email": "m@x.ru",
+        "lot_id": "", "order_id": "ORD1",
+        "purchase_ts": ac.time.time() - 3600,
+        "expires_at": ac.time.time() + 36000, "hours": 24, "lang": "ru",
+    }
+    base.update(over)
+    ac.save_rentals({base["order_key"]: base})
+    # neutralize templates so we don't depend on template files
+    monkeypatch.setattr(ac, "t", lambda key, **kw: key)
+    return base
+
+
+def test_bid_norm():
+    assert ac._bid_norm(12345) == ac._bid_norm("12345") == "12345"
+    assert ac._bid_norm(None) is None
+    assert ac._bid_norm("  ") is None
+
+
+def test_match_by_buyer_id_heals_chat_id(monkeypatch):
+    """Buyer name changed, chat_id stored is a stale user-id; match by buyer_id
+    and heal chat_id to the real incoming chat id."""
+    _seed_rental(monkeypatch, buyer="OldName", buyer_id="12345", chat_id="999")
+    c = _fake_cardinal()
+    e = _msg_event("!time", author="RenamedBuyer", author_id=12345,
+                   chat_id=264909029, chat_name="RenamedBuyer")
+    ac.on_new_message(c, e)
+    healed = ac.rentals()["ORD1"]["chat_id"]
+    assert healed == "264909029", healed
+
+
+def test_no_match_when_buyer_id_differs(monkeypatch):
+    _seed_rental(monkeypatch, buyer="OldName", buyer_id="12345", chat_id="999")
+    c = _fake_cardinal()
+    e = _msg_event("!time", author="Someone", author_id=99999, chat_id=264909029)
+    ac.on_new_message(c, e)
+    # unrelated buyer → rental must NOT be healed/stolen
+    assert ac.rentals()["ORD1"]["chat_id"] == "999"
+
+
+def test_seller_test_resolves_interlocutor(monkeypatch):
+    """Seller types !time in the buyer's chat: resolve the chat interlocutor
+    and match the rental by that buyer name."""
+    _seed_rental(monkeypatch, buyer="Dima548", buyer_id="55", chat_id="55")
+    chat_obj = _types.SimpleNamespace(name="Dima548")
+    c = _fake_cardinal(seller_id=7028500, chat_lookup={264575303: chat_obj})
+    e = _msg_event("!time", author="offsidez", author_id=7028500,
+                   chat_id=264575303, chat_name="offsidez")
+    ac.on_new_message(c, e)
+    assert ac.rentals()["ORD1"]["chat_id"] == "264575303"
+
+
+def test_send_to_buyer_repairs_stale_chat_id(monkeypatch):
+    """Sending to a stale user-id fails; _send_to_buyer resolves the real
+    chat_id via get_chat_by_name, persists it, and retries successfully."""
+    rental = _seed_rental(monkeypatch, buyer="Dima548", buyer_id="55", chat_id="55")
+    chat_obj = _types.SimpleNamespace(id=264575303, name="Dima548")
+    c = _fake_cardinal(name_lookup={"Dima548": chat_obj}, fail_chat_ids=("55",))
+    ok = ac._send_to_buyer(c, dict(rental), "ваш код: 1234")
+    assert ok is True
+    assert c._sent and c._sent[-1][0] == "264575303"
+    # persisted back onto the live rental record
+    assert ac.rentals()["ORD1"]["chat_id"] == "264575303"
+
+
+def test_send_to_buyer_returns_false_when_unresolvable(monkeypatch):
+    rental = _seed_rental(monkeypatch, buyer="Ghost", buyer_id="55", chat_id="55")
+    c = _fake_cardinal(name_lookup={}, fail_chat_ids=("55",))
+    ok = ac._send_to_buyer(c, dict(rental), "hi")
+    assert ok is False

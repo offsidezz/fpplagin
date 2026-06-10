@@ -439,3 +439,142 @@ def test_restore_scan_merges_existing_and_never_shortens(monkeypatch):
     assert ac._bid_norm(r["buyer_id"]) == "16710870"   # backfilled
     assert r["chat_id"] is None                          # broken user-id cleared
     assert r["expires_at"] == manual_exp                 # never shortened
+
+
+# ───────── review bonus parsing ─────────
+
+def test_parse_review_bonus():
+    assert ac._parse_review_bonus("NETFLIX 30 ДНЕЙ / 720ч • +12ч ЗА ОТЗЫВ") == 12
+    assert ac._parse_review_bonus("Подписка 24ч +6ч за отзыв") == 6
+    assert ac._parse_review_bonus("Netflix 1 ДЕНЬ / 24ч") == 0
+    assert ac._parse_review_bonus("") == 0
+    assert ac._parse_review_bonus("просто отзыв без бонуса") == 0
+
+
+# ───────── refund subtraction helper ─────────
+
+def test_apply_refund_subtracts_and_is_idempotent():
+    now = ac.time.time()
+    r = {
+        "order_id": "A", "order_ids": ["A", "B"],
+        "orders": [{"order_id": "A", "purchase_ts": now, "hours": 24},
+                   {"order_id": "B", "purchase_ts": now, "hours": 24}],
+        "expires_at": now + 48 * 3600, "hours": 48,
+    }
+    keep = ac._apply_refund_to_rental(r, "B", 24)
+    assert keep is True
+    assert r["hours"] == 24
+    assert abs(r["expires_at"] - (now + 24 * 3600)) < 2
+    assert r["order_ids"] == ["A"]
+    assert r["refunded_ids"] == ["B"]
+    # second call for same order must not subtract again
+    keep2 = ac._apply_refund_to_rental(r, "B", 24)
+    assert keep2 is True
+    assert r["hours"] == 24
+
+
+def test_apply_refund_removes_last_order():
+    now = ac.time.time()
+    r = {"order_id": "A", "order_ids": ["A"],
+         "orders": [{"order_id": "A", "purchase_ts": now, "hours": 24}],
+         "expires_at": now + 24 * 3600, "hours": 24}
+    keep = ac._apply_refund_to_rental(r, "A", 24)
+    assert keep is False    # nothing left → caller should drop it
+
+
+# ───────── order review existence check ─────────
+
+def test_order_review_exists():
+    acc_with = _types.SimpleNamespace(
+        get_order=lambda oid: _types.SimpleNamespace(review=_types.SimpleNamespace(stars=5)))
+    assert ac._order_review_exists(_types.SimpleNamespace(account=acc_with), "O1") is True
+
+    acc_without = _types.SimpleNamespace(
+        get_order=lambda oid: _types.SimpleNamespace(review=None))
+    assert ac._order_review_exists(_types.SimpleNamespace(account=acc_without), "O1") is False
+
+    assert ac._order_review_exists(_types.SimpleNamespace(account=acc_with), "") is False
+
+    acc_err = _types.SimpleNamespace(
+        get_order=lambda oid: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert ac._order_review_exists(_types.SimpleNamespace(account=acc_err), "O1") is False
+
+
+# ───────── review message grants bonus hours once ─────────
+
+def _review_event(author, author_id, chat_id, chat_name=None):
+    msg = _types.SimpleNamespace(
+        text="спасибо, всё ок", author=author, author_id=author_id,
+        chat_id=chat_id, chat_name=chat_name or author,
+        type=_types.SimpleNamespace(name="NEW_FEEDBACK"))
+    return _types.SimpleNamespace(message=msg)
+
+
+def test_review_grants_bonus_once(monkeypatch):
+    now = ac.time.time()
+    _seed_rental(monkeypatch, buyer="Dima548", buyer_id="16710870",
+                 chat_id="264909029", review_bonus=12,
+                 expires_at=now + 10 * 3600, hours=24)
+    c = _fake_cardinal()
+    e = _review_event("Dima548", 16710870, 264909029)
+    ac.on_new_message(c, e)
+    r = ac.rentals()["ORD1"]
+    assert r["review_bonus_given"] is True
+    assert r["hours"] == 36
+    assert abs(r["expires_at"] - (now + 22 * 3600)) < 2
+    # a second review must not stack again
+    ac.on_new_message(c, _review_event("Dima548", 16710870, 264909029))
+    assert ac.rentals()["ORD1"]["hours"] == 36
+
+
+# ───────── live refund event ─────────
+
+def test_on_order_status_changed_refund(monkeypatch):
+    now = ac.time.time()
+    ac.save_rentals({"A": {
+        "order_key": "A", "buyer": "Dima548", "buyer_id": "16710870",
+        "chat_id": "264909029", "email": "m@x.ru", "lot_id": "111",
+        "order_id": "A", "order_ids": ["A"],
+        "orders": [{"order_id": "A", "purchase_ts": now, "hours": 24}],
+        "expires_at": now + 24 * 3600, "hours": 24, "lang": "ru",
+    }})
+    monkeypatch.setattr(ac, "_notify_tg", lambda *a, **k: None)
+    order = _types.SimpleNamespace(id="A", description="Netflix 1 ДЕНЬ / 24ч",
+                                   status=_types.SimpleNamespace(name="REFUNDED"))
+    e = _types.SimpleNamespace(order=order)
+    c = _fake_cardinal()
+    ac.on_order_status_changed(c, e)
+    assert "A" not in ac.rentals()    # single refunded order → rental removed
+
+
+# ───────── restore scan subtracts a refunded order ─────────
+
+def test_restore_scan_subtracts_refund(monkeypatch):
+    monkeypatch.setattr(ac.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "_notify_tg", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "accounts", lambda: [{"email": "m@x.ru", "lot_ids": []}])
+    monkeypatch.setattr(ac, "_shutdown_flag", {"stop": False}, raising=False)
+    now = ac.time.time()
+    # existing rental that stacked O1(24h)+O2(24h)=48h; O2 gets refunded.
+    ac.save_rentals({"O1": {
+        "order_key": "O1", "buyer": "Dima548", "buyer_id": "16710870",
+        "chat_id": "264818884", "chat_name": "Dima548", "email": "m@x.ru",
+        "lot_id": "111", "order_id": "O1", "order_ids": ["O1", "O2"],
+        "orders": [{"order_id": "O1", "purchase_ts": now - 3 * 3600, "hours": 24},
+                   {"order_id": "O2", "purchase_ts": now - 2 * 3600, "hours": 24}],
+        "purchase_ts": now - 3 * 3600, "expires_at": now + 45 * 3600,
+        "hours": 48, "lang": "ru",
+    }})
+    paid = _make_shortcut("O1", "Dima548", "users-7028500-16710870",
+                          "Netflix 1 ДЕНЬ / 24ч", "111", now - 3 * 3600)
+    refunded = _make_shortcut("O2", "Dima548", "users-7028500-16710870",
+                              "Netflix 1 ДЕНЬ / 24ч", "111", now - 2 * 3600)
+    refunded.status = _types.SimpleNamespace(name="REFUNDED")
+    c = _make_scan_cardinal([paid, refunded])
+    ac._startup_sales_scan(c)
+    rents = ac.rentals()
+    assert "O1" in rents
+    r = rents["O1"]
+    assert "O2" not in [str(x) for x in r["order_ids"]]
+    assert r["hours"] == 24            # 48 - 24 refunded
+    assert "O2" in r["refunded_ids"]

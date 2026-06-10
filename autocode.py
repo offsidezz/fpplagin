@@ -35,7 +35,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.6.0"
+VERSION = "5.7.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
@@ -414,6 +414,62 @@ def _stack_b2(orders):
     return earliest, total_hours, exp, order_ids
 
 
+def _parse_review_bonus(text: str) -> int:
+    """Hours auto-added when the buyer leaves a review, parsed from a lot
+    title like '... 720ч • +12ч ЗА ОТЗЫВ'. Returns 0 if not present."""
+    if not text:
+        return 0
+    s = text.lower()
+    m = re.search(r"[+➕]\s*(\d+)\s*ч[а-я.]*\s*[•|/\-–]?\s*за\s+отзыв", s)
+    if m:
+        return int(m.group(1))
+    if "отзыв" in s:                       # looser: any +Nч near 'отзыв'
+        m = re.search(r"[+➕]\s*(\d+)\s*ч", s)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def _apply_refund_to_rental(r: dict, order_id, hours: int = 0) -> bool:
+    """Subtract a refunded order's contribution from a rental (idempotent via
+    ``refunded_ids``). Returns True if the rental still has remaining orders,
+    False if every order was refunded (caller should drop it)."""
+    oid  = str(order_id)
+    done = {str(x) for x in r.get("refunded_ids", [])}
+    if oid in done:
+        return bool(r.get("order_ids") or r.get("orders"))
+    h = int(hours or 0)
+    for od in r.get("orders", []):
+        if str(od.get("order_id")) == oid:
+            h = int(od.get("hours", h) or h)
+            break
+    if h:
+        r["expires_at"] = _safe_ts(r.get("expires_at", 0)) - h * 3600
+        r["hours"]      = max(0, int(r.get("hours", 0) or 0) - h)
+    r["orders"]    = [od for od in r.get("orders", []) if str(od.get("order_id")) != oid]
+    r["order_ids"] = [x for x in r.get("order_ids", []) if str(x) != oid]
+    done.add(oid)
+    r["refunded_ids"] = sorted(done)
+    return bool(r.get("order_ids") or r.get("orders"))
+
+
+def _order_review_exists(cardinal, order_id) -> bool:
+    """True if the FunPay order already carries a buyer review. Defensive: any
+    failure (API error / older Cardinal) returns False so the review request
+    still goes out rather than being silently swallowed."""
+    if not order_id:
+        return False
+    try:
+        acc = getattr(cardinal, "account", None)
+        if acc is None or not hasattr(acc, "get_order"):
+            return False
+        order  = acc.get_order(str(order_id))
+        return getattr(order, "review", None) is not None
+    except Exception as e:
+        logger.warning(f"AutoCode: get_order({order_id}) review-check failed: {e}")
+        return False
+
+
 def _safe_ts(value) -> float:
     if value is None:
         return 0.0
@@ -597,7 +653,8 @@ L_DEFAULTS = {
                           "{custom}",
     "extend_link":        "🔄 Для продления оформите новый заказ по ссылке:\nhttps://funpay.com/lots/offer?id={lot_id}",
     "extend_no_rental":   "❌ У вас нет активной аренды для продления.",
-    "order_confirm":      "✅ Если всё работает — пожалуйста, подтвердите заказ:\nhttps://funpay.com/orders/{order_id}/",
+    "order_confirm":      "✅ Если всё работает — пожалуйста, оставьте отзыв 🙏\nhttps://funpay.com/orders/{order_id}/",
+    "review_bonus_added": "🎁 Спасибо за отзыв! Аренда продлена на +{h}ч.\n📅 Новое окончание: {t}",
 }
 
 # Editable text keys shown in TG settings (display_name → L_DEFAULTS key)
@@ -618,7 +675,8 @@ _EDITABLE_TEXTS = {
     "FAQ":                   "faq",
     "Ссылка продления":      "extend_link",
     "Нет аренды (продл.)":   "extend_no_rental",
-    "Подтвержд. заказа":     "order_confirm",
+    "Запрос отзыва (заказ)":  "order_confirm",
+    "Бонус за отзыв":         "review_bonus_added",
 }
 
 def t(key: str, **kwargs) -> str:
@@ -1286,7 +1344,7 @@ def _startup_sales_scan(cardinal):
                     start_from=start_from,
                     include_paid=True,
                     include_closed=True,
-                    include_refunded=False,
+                    include_refunded=True,   # needed to subtract refunds
                 )
                 if isinstance(result, tuple):
                     next_id   = result[0]
@@ -1350,10 +1408,13 @@ def _startup_sales_scan(cardinal):
         seller_id = getattr(acc_obj, "id", None)
 
         # ── Phase 1: extract normalized rental orders within the window ──
-        orders = []
+        orders         = []
+        refunded_pairs = []   # (order_id, hours) of refunded orders to subtract
         for shortcut in all_shortcuts:
             try:
                 order_id = str(getattr(shortcut, "id", "") or getattr(shortcut, "order_id", ""))
+                _st      = getattr(shortcut, "status", None)
+                is_refunded = "REFUND" in (getattr(_st, "name", "") or str(_st or "")).upper()
 
                 # Try multiple attributes to find the lot title carrying duration
                 _lot_candidates = []
@@ -1418,9 +1479,15 @@ def _startup_sales_scan(cardinal):
                     skip_no_acc += 1
                     continue
 
+                if is_refunded:
+                    # Don't count refunded orders into any stack; record them so
+                    # their hours are subtracted from existing rentals (Phase 3).
+                    refunded_pairs.append((order_id, hours))
+                    continue
+
                 orders.append({
                     "order_id": order_id, "buyer": buyer, "buyer_id": buyer_id,
-                    "lot_id": lot_id, "email": acc_email,
+                    "lot_id": lot_id, "email": acc_email, "lot_name": lot_name,
                     "purchase_ts": purchase_ts, "hours": hours,
                 })
             except Exception as e:
@@ -1446,6 +1513,10 @@ def _startup_sales_scan(cardinal):
             buyer_id   = next((o["buyer_id"] for o in reversed(glist) if o["buyer_id"]), None)
             email      = gkey[1]
             lot_id     = glist[-1]["lot_id"]
+            lot_name   = glist[-1].get("lot_name", "")
+            review_bonus = _parse_review_bonus(lot_name)
+            order_detail = [{"order_id": o["order_id"], "purchase_ts": o["purchase_ts"],
+                             "hours": o["hours"]} for o in glist if o["order_id"]]
 
             ex_keys = existing_by_group.get(gkey, [])
             if ex_keys:
@@ -1467,6 +1538,15 @@ def _startup_sales_scan(cardinal):
                     merged_ids.add(str(r.get("order_id")))
                 merged_ids.update(str(x) for x in r.get("order_ids", []))
                 r["order_ids"]   = sorted(i for i in merged_ids if i)
+                # Merge per-order detail (backfill for accurate refund subtraction)
+                _have = {str(o.get("order_id")) for o in r.get("orders", [])}
+                r.setdefault("orders", [])
+                for od in order_detail:
+                    if str(od["order_id"]) not in _have:
+                        r["orders"].append(od)
+                r["lot_name"]     = r.get("lot_name") or lot_name
+                if review_bonus:
+                    r["review_bonus"] = review_bonus
                 r["hours"]       = max(int(r.get("hours", 0) or 0), total_hours)
                 r["purchase_ts"] = min(_safe_ts(r.get("purchase_ts", 0)) or earliest, earliest)
                 rents[keep] = r
@@ -1484,23 +1564,50 @@ def _startup_sales_scan(cardinal):
                     continue
                 key = order_ids[0] if order_ids else str(uuid_lib.uuid4())
                 rents[key] = {
-                    "order_key":   key,
-                    "buyer":       buyer_disp,
-                    "buyer_id":    buyer_id,
-                    "chat_id":     None,
-                    "chat_name":   buyer_disp,
-                    "email":       email,
-                    "lot_id":      lot_id,
-                    "order_id":    order_ids[0] if order_ids else key,
-                    "order_ids":   order_ids,
-                    "purchase_ts": earliest,
-                    "expires_at":  computed_exp,
-                    "hours":       total_hours,
-                    "restored":    True,
-                    "lang":        "ru",
+                    "order_key":    key,
+                    "buyer":        buyer_disp,
+                    "buyer_id":     buyer_id,
+                    "chat_id":      None,
+                    "chat_name":    buyer_disp,
+                    "email":        email,
+                    "lot_id":       lot_id,
+                    "lot_name":     lot_name,
+                    "order_id":     order_ids[0] if order_ids else key,
+                    "order_ids":    order_ids,
+                    "orders":       order_detail,
+                    "review_bonus": review_bonus,
+                    "purchase_ts":  earliest,
+                    "expires_at":   computed_exp,
+                    "hours":        total_hours,
+                    "restored":     True,
+                    "lang":         "ru",
                 }
                 created += 1
                 no_chat += 1
+
+        # ── Phase 3: subtract refunded orders from any rental that counted
+        #    them (idempotent via per-rental refunded_ids). Newly-built stacks
+        #    already excluded refunds, so this only touches pre-existing data. ──
+        refund_adjusted = 0
+        refund_removed  = 0
+        for oid, rh in refunded_pairs:
+            soid = str(oid)
+            for k in list(rents.keys()):
+                r = rents[k]
+                referenced = (str(r.get("order_id")) == soid
+                              or soid in [str(x) for x in r.get("order_ids", [])]
+                              or any(str(o.get("order_id")) == soid for o in r.get("orders", [])))
+                if not referenced:
+                    continue
+                if soid in {str(x) for x in r.get("refunded_ids", [])}:
+                    break
+                keep_it = _apply_refund_to_rental(r, soid, rh)
+                if not keep_it:
+                    rents.pop(k, None)
+                    refund_removed += 1
+                else:
+                    refund_adjusted += 1
+                break
 
         restored = created + updated
         save_rentals(rents)
@@ -1512,7 +1619,8 @@ def _startup_sales_scan(cardinal):
 
         diag = (
             f"AutoCode: сканирование завершено. "
-            f"Создано: {created}, обновлено: {updated} (без chat_id: {no_chat}), пропущено: {skipped} "
+            f"Создано: {created}, обновлено: {updated} (без chat_id: {no_chat}), "
+            f"возвраты: -{refund_adjusted}/удалено {refund_removed}, пропущено: {skipped} "
             f"[нет часов: {skip_no_hours}, нет акк: {skip_no_acc}, "
             f"истёк: {skip_expired}, дублей слито: {skip_existing}, нет даты: {skip_no_purchase}]. "
             f"Всего в файле: {len(rents)}, из них активных: {active_count}."
@@ -1521,10 +1629,12 @@ def _startup_sales_scan(cardinal):
 
         # Always notify with active count
         extra = f"\n⚠️ Без chat_id: {no_chat}" if no_chat else ""
+        refund_line = (f"\n↩️ Возвраты: {refund_adjusted + refund_removed}"
+                       if (refund_adjusted or refund_removed) else "")
         _notify_tg(cardinal,
             f"📊 AutoCode: сканирование продаж за 31 день.\n"
             f"Новых аренд: {created}, обновлено: {updated}\n"
-            f"🏠 Активных аренд: {active_count}\n"
+            f"🏠 Активных аренд: {active_count}{refund_line}\n"
             f"В файле всего: {len(rents)}{extra}"
         )
 
@@ -1663,13 +1773,18 @@ def _expiry_watcher(cardinal):
 
 
 
-def _schedule_review_request(cardinal, chat_id, chat_name, buyer):
+def _schedule_review_request(cardinal, chat_id, chat_name, buyer, order_id=None):
     def _send():
         if _shutdown_flag["stop"]:
             return
         try:
             settings = app_settings()
             if not settings.get("review_enabled", True):
+                return
+            # If the buyer already left a review for this order, stay silent —
+            # only the code itself should have been sent.
+            if order_id and _order_review_exists(cardinal, order_id):
+                logger.info(f"AutoCode: review already exists for {order_id}, skip nudge")
                 return
             has_rental = any(
                 r.get("buyer") == buyer for r in rentals().values()
@@ -1700,9 +1815,13 @@ def _schedule_order_confirm(cardinal, chat_id, chat_name, order_id):
             settings = app_settings()
             if not settings.get("confirm_enabled", True):
                 return
+            # Skip the "leave a review" nudge if the order already has one.
+            if _order_review_exists(cardinal, order_id):
+                logger.info(f"AutoCode: review already exists for {order_id}, skip review request")
+                return
             msg = t("order_confirm", order_id=order_id)
             cardinal.send_message(chat_id, msg, chat_name)
-            logger.info(f"AutoCode order confirm sent: {order_id}")
+            logger.info(f"AutoCode review request (order link) sent: {order_id}")
         except Exception as e:
             logger.warning(f"Order confirm fail {order_id}: {e}")
 
@@ -1866,6 +1985,16 @@ def on_new_order(c, e: NewOrderEvent):
                 rents[k]["hours"]      = rents[k].get("hours", 0) + hours
                 if buyer_id and not rents[k].get("buyer_id"):
                     rents[k]["buyer_id"] = buyer_id
+                # Track per-order detail (for accurate refund subtraction) and
+                # the lot name / review bonus (for "+Nч за отзыв" auto-extend).
+                _ords = rents[k].setdefault("orders", [])
+                if not any(str(o.get("order_id")) == order_id for o in _ords):
+                    _ords.append({"order_id": order_id, "purchase_ts": now, "hours": hours})
+                _oids = rents[k].setdefault("order_ids", [])
+                if order_id and order_id not in _oids:
+                    _oids.append(order_id)
+                rents[k]["lot_name"]     = lot_name
+                rents[k]["review_bonus"] = _parse_review_bonus(lot_name) or rents[k].get("review_bonus", 0)
                 cur_lang = get_buyer_lang(buyer, desc + " " + lot_name) or lang
                 rents[k]["lang"] = cur_lang
                 save_rentals(rents)
@@ -1913,18 +2042,22 @@ def on_new_order(c, e: NewOrderEvent):
     expires_at = now + hours * 3600 + loyalty_bonus_sec
     with _rentals_lock:
         rents[order_id] = {
-            "order_key":   order_id,
-            "buyer":       buyer,
-            "buyer_id":    buyer_id,
-            "chat_id":     chat_id,
-            "chat_name":   chat_name,
-            "email":       acc_email,
-            "lot_id":      lot_id,
-            "order_id":    order_id,
-            "purchase_ts": now,
-            "expires_at":  expires_at,
-            "hours":       hours,
-            "lang":        lang,
+            "order_key":    order_id,
+            "buyer":        buyer,
+            "buyer_id":     buyer_id,
+            "chat_id":      chat_id,
+            "chat_name":    chat_name,
+            "email":        acc_email,
+            "lot_id":       lot_id,
+            "lot_name":     lot_name,
+            "order_id":     order_id,
+            "order_ids":    [order_id],
+            "orders":       [{"order_id": order_id, "purchase_ts": now, "hours": hours}],
+            "review_bonus": _parse_review_bonus(lot_name),
+            "purchase_ts":  now,
+            "expires_at":   expires_at,
+            "hours":        hours,
+            "lang":         lang,
         }
         save_rentals(rents)
     logger.info(
@@ -1958,6 +2091,49 @@ def on_new_order(c, e: NewOrderEvent):
 
     # Schedule order confirmation after first code delivery (5 min)
     # (actual sending happens in _on_result inside on_new_message)
+
+def on_order_status_changed(c, e: OrderStatusChangedEvent):
+    """When an order is refunded, subtract its contribution from the buyer's
+    rental (idempotent via refunded_ids). Removes the rental if nothing remains."""
+    global _cardinal_ref
+    _cardinal_ref = c
+    try:
+        order  = getattr(e, "order", None)
+        status = getattr(order, "status", None)
+        sname  = (getattr(status, "name", "") or str(status or "")).upper()
+        if "REFUND" not in sname:
+            return
+        oid = str(getattr(order, "id", "") or "")
+        if not oid:
+            return
+        h = 0
+        for _attr in ("description", "lot_name", "title", "short_description"):
+            _v = getattr(order, _attr, None)
+            if _v and isinstance(_v, str):
+                h = _parse_hours(_v) or 0
+                if h:
+                    break
+        rents = rentals()
+        for k in list(rents.keys()):
+            r = rents[k]
+            referenced = (str(r.get("order_id")) == oid
+                          or oid in [str(x) for x in r.get("order_ids", [])]
+                          or any(str(o.get("order_id")) == oid for o in r.get("orders", [])))
+            if not referenced:
+                continue
+            if oid in {str(x) for x in r.get("refunded_ids", [])}:
+                return
+            keep_it = _apply_refund_to_rental(r, oid, h)
+            if not keep_it:
+                rents.pop(k, None)
+            save_rentals(rents)
+            logger.info(f"AutoCode: refund applied for order {oid} (-{h}ч), kept={keep_it}")
+            _notify_tg(c, (f"↩️ Возврат заказа #{oid}: "
+                           f"{'аренда удалена' if not keep_it else f'аренда сокращена на {h}ч'}."))
+            return
+    except Exception as ex:
+        logger.warning(f"AutoCode: on_order_status_changed error: {ex}")
+
 
 def on_new_message(c, e: NewMessageEvent):
     global _cardinal_ref
@@ -2079,6 +2255,40 @@ def on_new_message(c, e: NewMessageEvent):
                 rents_changed = True
     if rents_changed:
         save_rentals(rents)
+
+    # ── Auto-extend on review: lots tagged "+Nч за отзыв" grant bonus hours
+    #    the first time the buyer leaves a review in this chat. ──
+    _mtype  = getattr(e.message, "type", None)
+    _mtname = (getattr(_mtype, "name", "") or "").upper()
+    _type_review = "FEEDBACK" in _mtname        # host-provided signal (trusted)
+    _text_review = (any(p in lower for p in ("написал отзыв", "оставил отзыв",
+                                             "изменил отзыв"))
+                    and ("к заказу" in lower or "#" in lower))
+    if _type_review or _text_review:
+        for r in _find_active_rentals_for_chat():
+            bonus = int(r.get("review_bonus", 0) or 0)
+            if bonus <= 0 or r.get("review_bonus_given"):
+                continue
+            # If we only have a text hint (no message type), confirm a real
+            # review exists via the API so nobody can game it by chatting.
+            if not _type_review:
+                _oids = [r.get("order_id"), *[x for x in r.get("order_ids", [])]]
+                if not any(_order_review_exists(c, o) for o in _oids if o):
+                    continue
+            r["expires_at"] = _safe_ts(r.get("expires_at", 0)) + bonus * 3600
+            r["hours"]      = int(r.get("hours", 0) or 0) + bonus
+            r["review_bonus_given"] = True
+            save_rentals(rents)
+            Thread(
+                target=c.send_message,
+                args=(chat_id,
+                      t("review_bonus_added", h=bonus, t=_fmt_time(r["expires_at"])),
+                      chat_name),
+                daemon=True,
+            ).start()
+            logger.info(f"AutoCode: review bonus +{bonus}ч for {r.get('buyer')}")
+            break
+        return
 
     if lower in ("!time", "time", "!время", "время"):
         active = _find_active_rentals_for_chat()
@@ -2223,9 +2433,10 @@ def on_new_message(c, e: NewMessageEvent):
         msg = t("code_msg", code=code_val, dt=received_dt)
         Thread(target=c.send_message, args=(chat_id, msg, chat_name), daemon=True).start()
 
-        _schedule_review_request(c, chat_id, chat_name, buyer_name)
+        _schedule_review_request(c, chat_id, chat_name, buyer_name, order_id)
 
-        # Schedule order confirmation after 5 min
+        # Ask buyer to leave a review (skipped automatically if one already
+        # exists — then only the code above was sent).
         _schedule_order_confirm(c, chat_id, chat_name, order_id)
 
     _imap_queue.submit(acc_email, fetch_code, _on_result, acc, used, not_before_ts=not_before_ts)
@@ -3333,6 +3544,7 @@ def init_autocode_tg(cardinal, *args):
 
 
 
-BIND_TO_PRE_INIT    = [init_autocode_tg]
-BIND_TO_NEW_ORDER   = [on_new_order]
-BIND_TO_NEW_MESSAGE = [on_new_message]
+BIND_TO_PRE_INIT             = [init_autocode_tg]
+BIND_TO_NEW_ORDER            = [on_new_order]
+BIND_TO_NEW_MESSAGE          = [on_new_message]
+BIND_TO_ORDER_STATUS_CHANGED = [on_order_status_changed]

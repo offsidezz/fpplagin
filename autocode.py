@@ -327,6 +327,26 @@ def _save(path, data):
     except Exception as e:
         logger.error(f"AutoCode: не удалось сохранить {path}: {e}")
 
+def _cid_norm(value) -> str | None:
+    """Normalize a chat_id to a comparable string.
+
+    chat_id is stored inconsistently across the codebase: restored rentals
+    keep it as a str ("12345" / "users-X-Y"), order events as str-or-None, and
+    `e.message.chat_id` arrives as an int. Comparing str == int silently fails,
+    so an active (restored) rental would look like "no active rental". Always
+    compare via this normalizer.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def _name_norm(value) -> str:
+    """Normalize a buyer/author name for tolerant comparison."""
+    return (value or "").strip().casefold()
+
+
 def _safe_ts(value) -> float:
     if value is None:
         return 0.0
@@ -1792,25 +1812,31 @@ def on_new_message(c, e: NewMessageEvent):
     rents = rentals()
     now = time.time()
 
+    cid_norm    = _cid_norm(chat_id)
+    author_norm = _name_norm(author)
+
     def _find_active_rentals_for_chat():
         """Find active rentals matching this chat_id (any participant).
         Falls back to buyer-name match and heals chat_id if needed."""
-        # 1. Exact chat_id match
+        # 1. chat_id match — normalized to string so restored rentals (str)
+        #    match an int e.message.chat_id (previously failed silently).
         results = [r for r in rents.values()
-                   if r.get("chat_id") == chat_id
+                   if cid_norm is not None
+                   and _cid_norm(r.get("chat_id")) == cid_norm
                    and _safe_ts(r.get("expires_at", 0)) > now]
         if results:
             return sorted(results,
                           key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
                           reverse=True)
 
-        # 2. Fallback: match by buyer name, heal the most recent
+        # 2. Fallback: match by buyer name (normalized), heal the most recent
         #    unmatched rental only (to avoid clobbering other chats).
         candidates = [
             (k, r) for k, r in rents.items()
-            if r.get("buyer") == author
+            if _name_norm(r.get("buyer")) == author_norm
+            and author_norm
             and _safe_ts(r.get("expires_at", 0)) > now
-            and r.get("chat_id") != chat_id
+            and _cid_norm(r.get("chat_id")) != cid_norm
         ]
         if candidates:
             # Prefer rentals with no chat_id (=None), then most recent
@@ -1819,11 +1845,11 @@ def on_new_message(c, e: NewMessageEvent):
                                -_safe_ts(x[1].get("purchase_ts", 0))))
             k, r = candidates[0]
             old_cid = r.get("chat_id")
-            rents[k]["chat_id"]   = chat_id
+            rents[k]["chat_id"]   = cid_norm
             rents[k]["chat_name"] = chat_name
             save_rentals(rents)
             logger.info(f"AutoCode: healed chat_id for rental {k} "
-                        f"(buyer={author}, {old_cid} → {chat_id})")
+                        f"(buyer={author}, {old_cid} → {cid_norm})")
             return [rents[k]]
 
         return []
@@ -1831,9 +1857,10 @@ def on_new_message(c, e: NewMessageEvent):
     # Update chat_id on rentals by buyer name if not set
     rents_changed = False
     for k, r in rents.items():
-        if r.get("buyer") == author and _safe_ts(r.get("expires_at", 0)) > now:
+        if _name_norm(r.get("buyer")) == author_norm and author_norm \
+           and _safe_ts(r.get("expires_at", 0)) > now:
             if not r.get("chat_id"):
-                rents[k]["chat_id"]   = chat_id
+                rents[k]["chat_id"]   = cid_norm
                 rents[k]["chat_name"] = chat_name
                 rents_changed = True
     if rents_changed:
@@ -1911,6 +1938,20 @@ def on_new_message(c, e: NewMessageEvent):
     active = _find_active_rentals_for_chat()
 
     if not active:
+        # Diagnostic: dump what active rentals exist so a real "no rental"
+        # can be told apart from a matching bug (buyer/chat_id mismatch).
+        _active_dump = [
+            {"buyer": r.get("buyer"), "chat_id": r.get("chat_id"),
+             "lot_id": r.get("lot_id"),
+             "left_min": int((_safe_ts(r.get("expires_at", 0)) - now) / 60)}
+            for r in rents.values()
+            if _safe_ts(r.get("expires_at", 0)) > now
+        ]
+        logger.warning(
+            f"AutoCode: !cd без аренды — author={author!r} (norm={author_norm!r}), "
+            f"chat_id={chat_id!r} (norm={cid_norm!r}). "
+            f"Активных аренд в файле: {len(_active_dump)} → {_active_dump[:10]}"
+        )
         Thread(
             target=c.send_message,
             args=(chat_id, t("no_rental"), chat_name),

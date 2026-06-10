@@ -565,13 +565,20 @@ def _get_text(msg) -> tuple[str, str]:
         for part in msg.walk():
             ct = part.get_content_type()
             if ct == "text/plain":
-                plain += part.get_payload(decode=True).decode(
-                    part.get_content_charset() or "utf-8", errors="replace"
-                )
+                # FIX: get_payload(decode=True) can return None (e.g. empty
+                # part / message/* subtype) → guard to avoid AttributeError,
+                # which would skip the whole email and lose a valid code.
+                payload = part.get_payload(decode=True)
+                if payload:
+                    plain += payload.decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
             elif ct == "text/html":
-                html += part.get_payload(decode=True).decode(
-                    part.get_content_charset() or "utf-8", errors="replace"
-                )
+                payload = part.get_payload(decode=True)
+                if payload:
+                    html += payload.decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
     else:
         payload = msg.get_payload(decode=True)
         if payload:
@@ -597,9 +604,13 @@ def _find_code(plain, html, subj, acc) -> str | None:
         # STRICT: exact length match — if code_len=4 only match exactly 4 chars
         pat = re.compile(rf"(?<!\w){char_cls}{{{code_len}}}(?!\w)")
     else:
-        # Auto: at least 4 chars, require digit for alnum types
+        # Auto: at least 4 chars, require digit for alnum types.
+        # FIX: the lookahead must require the digit *inside the matched token*,
+        # not merely somewhere later in the email. The old `(?=.*\d)` allowed a
+        # pure-letter word (e.g. "verification") to match as long as any digit
+        # appeared anywhere downstream.
         if code_type in ("alnum", "alnum-dash"):
-            pat = re.compile(rf"(?=.*\d){char_cls}{{4,64}}")
+            pat = re.compile(rf"(?={char_cls}*\d){char_cls}{{4,64}}")
         elif code_type == "digits":
             pat = re.compile(rf"\d{{4,64}}")
         else:
@@ -646,6 +657,14 @@ def fetch_code(acc, used, not_before_ts=None, dry_run=False) -> tuple[str | None
     max_age     = acc.get("max_age_min", 60)
     filter_from = acc.get("filter_from", "")
     filter_subj = acc.get("filter_subj", "")
+
+    # FIX (double-delivery race): always read the *current* used-codes state
+    # instead of relying on the snapshot captured before the IMAP queue ran.
+    # Tasks for the same mailbox are serialized by IMAPQueue, so a fresh read
+    # here is guaranteed to include codes marked used by the previous task.
+    # The `used` argument is kept only for backward compatibility / dry_run.
+    if not dry_run:
+        used = used_codes()
 
     raw_used = used.get(email_addr, [])
     used_set = set()
@@ -776,8 +795,6 @@ class IMAPQueue:
 
     def _worker(self, email_addr: str):
         q = self.queues[email_addr]
-        settings = app_settings()
-        pause = settings.get("queue_pause_sec", 2)
         while not _shutdown_flag["stop"]:
             try:
                 task_fn, callback, args, kwargs = q.get(timeout=5)
@@ -801,7 +818,9 @@ class IMAPQueue:
                     callback((None, f"Внутренняя ошибка: {e}"))
                 except Exception:
                     pass
-            time.sleep(pause)
+            # FIX: read pause each iteration so changes to queue_pause_sec in
+            # the TG settings take effect without restarting the plugin.
+            time.sleep(app_settings().get("queue_pause_sec", 2))
 
     def queue_size(self, email_addr: str) -> int:
         q = self.queues.get(email_addr)
@@ -1670,13 +1689,25 @@ def on_new_order(c, e: NewOrderEvent):
                     state[s_key].remove(k)
             save_warned(state)
 
-            Thread(
-                target=c.send_message,
-                args=(chat_id,
-                      t("rental_renewed", h=hours, t=_fmt_time(rents[k]['expires_at'])),
-                      chat_name),
-                daemon=True,
-            ).start()
+            # FIX: prefer the chat_id stored on the rental (it was healed when
+            # the buyer first wrote in the order chat). The chat_id on a
+            # NewOrderEvent is frequently None, so using it here silently drops
+            # the "rental renewed" confirmation.
+            target_chat_id   = rents[k].get("chat_id") or chat_id
+            target_chat_name = rents[k].get("chat_name") or chat_name
+            if target_chat_id:
+                Thread(
+                    target=c.send_message,
+                    args=(target_chat_id,
+                          t("rental_renewed", h=hours, t=_fmt_time(rents[k]['expires_at'])),
+                          target_chat_name),
+                    daemon=True,
+                ).start()
+            else:
+                logger.info(
+                    f"AutoCode: продление {buyer} — chat_id ещё неизвестен, "
+                    f"подтверждение уйдёт после первого сообщения в чате."
+                )
             return
 
     # ── Loyalty: +LOYALTY_BONUS_DAYS if buyer repurchases within LOYALTY_WINDOW_DAYS ──
@@ -1714,20 +1745,29 @@ def on_new_order(c, e: NewOrderEvent):
         f"до {_fmt_time(expires_at)} | order={order_id} | lang={lang}"
     )
 
-    Thread(
-        target=c.send_message,
-        args=(chat_id, t("rental_activated"), chat_name),
-        daemon=True,
-    ).start()
-
-    if loyalty_bonus_sec > 0:
+    # FIX: chat_id from a NewOrderEvent is often None. Only send now if we
+    # actually have a chat to send to; otherwise on_new_message heals the
+    # chat_id when the buyer first writes and the buyer can use !cd right away.
+    if chat_id:
         Thread(
             target=c.send_message,
-            args=(chat_id,
-                  t("loyalty_bonus", days=LOYALTY_BONUS_DAYS),
-                  chat_name),
+            args=(chat_id, t("rental_activated"), chat_name),
             daemon=True,
         ).start()
+
+        if loyalty_bonus_sec > 0:
+            Thread(
+                target=c.send_message,
+                args=(chat_id,
+                      t("loyalty_bonus", days=LOYALTY_BONUS_DAYS),
+                      chat_name),
+                daemon=True,
+            ).start()
+    else:
+        logger.info(
+            f"AutoCode: активация {buyer} — chat_id ещё неизвестен, "
+            f"приветствие будет пропущено (покупатель сразу может использовать !cd)."
+        )
 
     # Schedule order confirmation after first code delivery (5 min)
     # (actual sending happens in _on_result inside on_new_message)

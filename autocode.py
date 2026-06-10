@@ -347,6 +347,19 @@ def _name_norm(value) -> str:
     return (value or "").strip().casefold()
 
 
+def _bid_norm(value) -> str | None:
+    """Normalize a buyer/author *user-id* to a comparable string.
+
+    The order/restore API exposes the buyer's user-id (a small number, ~1-20M)
+    which is stable across display-name changes. We match on it as a robust
+    alternative to the buyer name. Note: this is NOT the chat_id (~264M).
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
 def _safe_ts(value) -> float:
     if value is None:
         return 0.0
@@ -1056,6 +1069,70 @@ def _send_with_retry(cardinal, chat_id, text, chat_name="") -> tuple[bool, str]:
                 time.sleep(2)
     return False, last_err
 
+def _lookup_real_chat_id(cardinal, buyer: str):
+    """Resolve the *real* FunPay chat_id (e.g. 264909029) for a buyer name.
+
+    The order/restore API exposes the buyer's user-id (a small number) which is
+    NOT a valid send target — sending to it raises "Доступ запрещён". The real
+    chat_id only comes from an incoming Message or get_chat_by_name(). Returns a
+    str chat_id, or None on failure.
+    """
+    if not buyer:
+        return None
+    try:
+        acc = getattr(cardinal, "account", None)
+        if acc is None or not hasattr(acc, "get_chat_by_name"):
+            return None
+        chat = acc.get_chat_by_name(buyer, True)
+        cid = getattr(chat, "id", None) if chat else None
+        return str(cid) if cid else None
+    except Exception as ex:
+        logger.warning(f"AutoCode: _lookup_real_chat_id({buyer!r}) failed: {ex}")
+        return None
+
+def _send_to_buyer(cardinal, rental: dict, text: str) -> bool:
+    """Send a message to a rental's buyer, repairing a stale chat_id.
+
+    Tries the stored chat_id first; on failure (commonly because the stored
+    value is the buyer's user-id, not a real chat_id) it resolves the real
+    chat_id via get_chat_by_name(), persists it back onto the rental, and
+    retries. This is what stops the "Доступ запрещён" outbound failures.
+    """
+    cid   = rental.get("chat_id")
+    cname = rental.get("chat_name") or rental.get("buyer") or ""
+    buyer = rental.get("buyer") or ""
+    key   = rental.get("order_key") or rental.get("order_id")
+
+    if cid:
+        try:
+            cardinal.send_message(cid, text, cname)
+            return True
+        except Exception as ex:
+            logger.warning(
+                f"AutoCode: send to chat_id={cid} (buyer={buyer}) failed: {ex}; "
+                f"resolving real chat_id…")
+
+    real = _lookup_real_chat_id(cardinal, buyer)
+    if real and _cid_norm(real) != _cid_norm(cid):
+        # Persist the healed chat_id onto the live rental record (if still present).
+        try:
+            with _rentals_lock:
+                rents = rentals()
+                if key in rents:
+                    rents[key]["chat_id"] = real
+                    save_rentals(rents)
+        except Exception as ex:
+            logger.warning(f"AutoCode: persist repaired chat_id failed: {ex}")
+        rental["chat_id"] = real
+        logger.info(f"AutoCode: repaired chat_id for {buyer}: {cid} → {real}")
+        try:
+            cardinal.send_message(real, text, cname)
+            return True
+        except Exception as ex:
+            logger.warning(
+                f"AutoCode: send to repaired chat_id={real} (buyer={buyer}) failed: {ex}")
+    return False
+
 def _startup_imap_test(cardinal):
     time.sleep(5)
     accs = accounts()
@@ -1241,11 +1318,16 @@ def _startup_sales_scan(cardinal):
                 buyer     = str(getattr(shortcut, "buyer_username", "") or getattr(shortcut, "buyer", "") or "")
                 lot_id    = str(getattr(shortcut, "lot_id", "") or "")
 
-                # FIX: chat_id in Cardinal is a string like "users-XXX-YYY",
-                # store as-is (not int).
-                chat_id = getattr(shortcut, "chat_id", None) or None
-                if chat_id:
-                    chat_id = str(chat_id).strip()
+                # NOTE: shortcut.chat_id here is actually the buyer's *user-id*
+                # (a small number ~1-20M), NOT a real chat_id (~264M). Storing
+                # it as chat_id breaks matching AND makes every outbound send
+                # raise "Доступ запрещён". So capture it as buyer_id (used for
+                # robust matching) and leave chat_id None — it is healed on the
+                # buyer's first message and repaired before any outbound send.
+                buyer_id = (getattr(shortcut, "buyer_id", None)
+                            or getattr(shortcut, "chat_id", None))
+                buyer_id = str(buyer_id).strip() if buyer_id else None
+                chat_id  = None
 
                 purchase_ts = None
                 if hasattr(shortcut, "date_ts"):
@@ -1299,16 +1381,9 @@ def _startup_sales_scan(cardinal):
                     continue
 
                 chat_name = buyer
-                if not chat_id:
-                    try:
-                        chat = acc_obj.get_chat_by_name(buyer, True)
-                        if chat:
-                            _cid = chat.id
-                            chat_id   = str(_cid) if _cid else None
-                            chat_name = getattr(chat, "name", buyer)
-                    except Exception:
-                        pass
-
+                # chat_id is resolved lazily (heal on first buyer message /
+                # repair before outbound) to avoid hammering get_chat_by_name
+                # for every restored order during the bulk scan.
                 if not chat_id:
                     no_chat += 1
 
@@ -1316,6 +1391,7 @@ def _startup_sales_scan(cardinal):
                 rents[key] = {
                     "order_key":   key,
                     "buyer":       buyer,
+                    "buyer_id":    buyer_id,
                     "chat_id":     chat_id,
                     "chat_name":   chat_name,
                     "email":       acc_email,
@@ -1459,28 +1535,22 @@ def _expiry_watcher(cardinal):
 
                 left = exp - now
 
-                if not cid:
-                    if now >= exp + 60:
-                        del rents[key]
-                        warned_12h.discard(key)
-                        changed = True
-                        state_dirty = True
-                        logger.info(f"AutoCode: аренда {key} ({r.get('buyer')}) завершена (без chat_id).")
-                    continue
-
                 warn_sec = WARN_BEFORE_H * 3600
                 if (key not in warned_12h
                         and (warn_sec - 600) <= left <= warn_sec):
                     warned_12h.add(key)
                     state_dirty = True
+                    # _send_to_buyer resolves/repairs the real chat_id if the
+                    # stored one is a user-id (or missing) → no "Доступ запрещён".
                     Thread(
-                        target=cardinal.send_message,
-                        args=(cid, t("warn_12h", h=WARN_BEFORE_H), cname),
+                        target=_send_to_buyer,
+                        args=(cardinal, r, t("warn_12h", h=WARN_BEFORE_H)),
                         daemon=True,
                     ).start()
 
                 if now >= exp + 60:
                     # FIX: Lock rental deletion to prevent race with on_new_order
+                    snapshot = dict(r)  # keep buyer/chat_id for the farewell send
                     with _rentals_lock:
                         del rents[key]
                         warned_12h.discard(key)
@@ -1489,8 +1559,8 @@ def _expiry_watcher(cardinal):
                         save_rentals(rents)
                     _persist_state()
                     Thread(
-                        target=cardinal.send_message,
-                        args=(cid, t("rental_ended"), cname),
+                        target=_send_to_buyer,
+                        args=(cardinal, snapshot, t("rental_ended")),
                         daemon=True,
                     ).start()
 
@@ -1670,9 +1740,14 @@ def on_new_order(c, e: NewOrderEvent):
         return
 
     buyer     = getattr(e.order, "buyer_username", "") or ""
-    # FIX: chat_id is a string like "users-XXX-YYY", store as-is
-    _raw_cid  = getattr(e.order, "chat_id", None)
-    chat_id   = str(_raw_cid).strip() if _raw_cid else None
+    # NOTE: e.order.chat_id is frequently None and, when present, is the buyer's
+    # user-id (not a real chat_id ~264M). Capture it as buyer_id for robust
+    # matching and leave chat_id None — it is healed when the buyer first writes
+    # (and repaired before any outbound send). This avoids the "Доступ запрещён"
+    # failures from sending to a user-id.
+    _raw_bid  = getattr(e.order, "buyer_id", None) or getattr(e.order, "chat_id", None)
+    buyer_id  = str(_raw_bid).strip() if _raw_bid else None
+    chat_id   = None
     chat_name = getattr(e.order, "chat_name", "") or buyer
     order_id  = str(getattr(e.order, "id", uuid_lib.uuid4()))
     lot_id    = str(getattr(e.order, "lot_id", ""))
@@ -1700,6 +1775,8 @@ def on_new_order(c, e: NewOrderEvent):
             with _rentals_lock:
                 rents[k]["expires_at"] = _safe_ts(rents[k].get("expires_at", 0)) + hours * 3600
                 rents[k]["hours"]      = rents[k].get("hours", 0) + hours
+                if buyer_id and not rents[k].get("buyer_id"):
+                    rents[k]["buyer_id"] = buyer_id
                 cur_lang = get_buyer_lang(buyer, desc + " " + lot_name) or lang
                 rents[k]["lang"] = cur_lang
                 save_rentals(rents)
@@ -1749,6 +1826,7 @@ def on_new_order(c, e: NewOrderEvent):
         rents[order_id] = {
             "order_key":   order_id,
             "buyer":       buyer,
+            "buyer_id":    buyer_id,
             "chat_id":     chat_id,
             "chat_name":   chat_name,
             "email":       acc_email,
@@ -1814,10 +1892,25 @@ def on_new_message(c, e: NewMessageEvent):
 
     cid_norm    = _cid_norm(chat_id)
     author_norm = _name_norm(author)
+    author_id   = _bid_norm(getattr(e.message, "author_id", None))
+    seller_id   = _bid_norm(getattr(getattr(c, "account", None), "id", None))
+    is_seller   = bool(author_id) and author_id == seller_id
+
+    def _heal(k, reason):
+        """Stamp the real incoming chat_id onto a matched rental and persist."""
+        old_cid = rents[k].get("chat_id")
+        rents[k]["chat_id"]   = cid_norm
+        rents[k]["chat_name"] = chat_name
+        save_rentals(rents)
+        logger.info(f"AutoCode: healed chat_id for rental {k} via {reason} "
+                    f"(buyer={rents[k].get('buyer')}, {old_cid} → {cid_norm})")
+        return [rents[k]]
 
     def _find_active_rentals_for_chat():
-        """Find active rentals matching this chat_id (any participant).
-        Falls back to buyer-name match and heals chat_id if needed."""
+        """Find active rentals for this chat. Tiers, in order:
+        1) real chat_id match, 2) buyer user-id match, 3) buyer-name match,
+        4) seller testing → resolve the chat's interlocutor and match by name.
+        Each fallback heals chat_id so subsequent lookups/sends hit tier 1."""
         # 1. chat_id match — normalized to string so restored rentals (str)
         #    match an int e.message.chat_id (previously failed silently).
         results = [r for r in rents.values()
@@ -1829,7 +1922,20 @@ def on_new_message(c, e: NewMessageEvent):
                           key=lambda r: _safe_ts(r.get("purchase_ts", 0)),
                           reverse=True)
 
-        # 2. Fallback: match by buyer name (normalized), heal the most recent
+        # 2. buyer user-id match (stable across name changes). Only when the
+        #    message is from the buyer (not the seller). Most robust signal.
+        if author_id and not is_seller:
+            id_cands = [
+                (k, r) for k, r in rents.items()
+                if _bid_norm(r.get("buyer_id")) == author_id
+                and _safe_ts(r.get("expires_at", 0)) > now
+                and _cid_norm(r.get("chat_id")) != cid_norm
+            ]
+            if id_cands:
+                id_cands.sort(key=lambda x: -_safe_ts(x[1].get("purchase_ts", 0)))
+                return _heal(id_cands[0][0], "buyer_id")
+
+        # 3. Fallback: match by buyer name (normalized), heal the most recent
         #    unmatched rental only (to avoid clobbering other chats).
         candidates = [
             (k, r) for k, r in rents.items()
@@ -1843,14 +1949,33 @@ def on_new_message(c, e: NewMessageEvent):
             candidates.sort(
                 key=lambda x: (0 if not x[1].get("chat_id") else 1,
                                -_safe_ts(x[1].get("purchase_ts", 0))))
-            k, r = candidates[0]
-            old_cid = r.get("chat_id")
-            rents[k]["chat_id"]   = cid_norm
-            rents[k]["chat_name"] = chat_name
-            save_rentals(rents)
-            logger.info(f"AutoCode: healed chat_id for rental {k} "
-                        f"(buyer={author}, {old_cid} → {cid_norm})")
-            return [rents[k]]
+            return _heal(candidates[0][0], "buyer-name")
+
+        # 4. Seller testing the command inside a buyer's chat: the author is the
+        #    seller, so name/id can't match. Resolve the chat's interlocutor
+        #    (the actual buyer) and match the rental by that name.
+        if is_seller and cid_norm is not None:
+            interloc = ""
+            try:
+                acc = getattr(c, "account", None)
+                chat = None
+                if acc is not None and hasattr(acc, "get_chat"):
+                    _arg = int(chat_id) if str(chat_id).isdigit() else chat_id
+                    chat = acc.get_chat(_arg)
+                if chat is not None:
+                    interloc = _name_norm(getattr(chat, "name", "")
+                                          or getattr(chat, "interlocutor", ""))
+            except Exception as ex:
+                logger.warning(f"AutoCode: get_chat({chat_id}) failed: {ex}")
+            if interloc:
+                seller_cands = [
+                    (k, r) for k, r in rents.items()
+                    if _name_norm(r.get("buyer")) == interloc
+                    and _safe_ts(r.get("expires_at", 0)) > now
+                ]
+                if seller_cands:
+                    seller_cands.sort(key=lambda x: -_safe_ts(x[1].get("purchase_ts", 0)))
+                    return _heal(seller_cands[0][0], f"seller-test/{interloc}")
 
         return []
 
@@ -1941,14 +2066,15 @@ def on_new_message(c, e: NewMessageEvent):
         # Diagnostic: dump what active rentals exist so a real "no rental"
         # can be told apart from a matching bug (buyer/chat_id mismatch).
         _active_dump = [
-            {"buyer": r.get("buyer"), "chat_id": r.get("chat_id"),
-             "lot_id": r.get("lot_id"),
+            {"buyer": r.get("buyer"), "buyer_id": r.get("buyer_id"),
+             "chat_id": r.get("chat_id"), "lot_id": r.get("lot_id"),
              "left_min": int((_safe_ts(r.get("expires_at", 0)) - now) / 60)}
             for r in rents.values()
             if _safe_ts(r.get("expires_at", 0)) > now
         ]
         logger.warning(
-            f"AutoCode: !cd без аренды — author={author!r} (norm={author_norm!r}), "
+            f"AutoCode: !cd без аренды — author={author!r} (norm={author_norm!r}, "
+            f"id={author_id!r}, seller={is_seller}), "
             f"chat_id={chat_id!r} (norm={cid_norm!r}). "
             f"Активных аренд в файле: {len(_active_dump)} → {_active_dump[:10]}"
         )

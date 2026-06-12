@@ -39,9 +39,9 @@ NAME = "AutoCode"
 VERSION = "5.9.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
-    "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
-    "v5.5.0: только RU, все тексты редактируемы в TG, команды для всех, подтверждение заказа, фикс IMAP.\n"
-    "Управление: /autocode"
+    "Авто-выдача кодов с IMAP-почт по команде !cd / code / код.\n"
+    "Учёт аренд, напоминания об окончании, возвраты и бонус-часы за отзыв.\n"
+    "Привязка почты к лоту или категории. Управление в Telegram: /autocode"
 )
 CREDITS = "@offsidezq"
 SETTINGS_PAGE = False

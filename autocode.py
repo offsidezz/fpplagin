@@ -36,7 +36,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.8.0"
+VERSION = "5.9.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code.\n"
@@ -59,6 +59,9 @@ AC_DEL_OK        = "ac_del_ok"
 AC_LOTS          = "ac_lots"
 AC_LOT_ADD       = "ac_lot_add"
 AC_LOT_DEL       = "ac_lot_del"
+AC_CATS          = "ac_cats"
+AC_CAT_ADD       = "ac_cat_add"
+AC_CAT_DEL       = "ac_cat_del"
 AC_WINDOW        = "ac_window"
 AC_MAX_AGE       = "ac_max_age"
 AC_LEN           = "ac_len"
@@ -351,6 +354,92 @@ def _name_norm(value) -> str:
 def _email_key(value) -> str:
     """Normalize an email for keying/comparison (case-insensitive)."""
     return (value or "").strip().lower()
+
+
+def _cat_norm(value) -> str:
+    """Normalize a FunPay category name for tolerant comparison.
+
+    Lower-cases, trims and collapses internal whitespace so that minor
+    spacing/case differences between the seller's entered name and the
+    name FunPay reports on an order don't break the match.
+    """
+    return " ".join(str(value or "").lower().split())
+
+
+def _order_category_names(order) -> set[str]:
+    """Collect normalized category-name candidates from an order/shortcut.
+
+    FunPay (Cardinal) exposes the lot's section via ``order.subcategory`` — a
+    SubCategory object carrying ``.name`` (e.g. "Аккаунты"), ``.fullname``
+    (e.g. "Brawl Stars, Аккаунты") and a parent ``.category`` with its own
+    ``.name``. Some builds also surface a plain ``subcategory_name`` string.
+    We gather every available variant (normalized) so category binding works
+    regardless of which attribute the host build provides.
+    """
+    out: set[str] = set()
+    if order is None:
+        return out
+    sub = getattr(order, "subcategory", None)
+    if sub is not None:
+        for attr in ("fullname", "name"):
+            v = getattr(sub, attr, None)
+            if isinstance(v, str) and v.strip():
+                out.add(_cat_norm(v))
+        cat = getattr(sub, "category", None)
+        cv = getattr(cat, "name", None)
+        if isinstance(cv, str) and cv.strip():
+            out.add(_cat_norm(cv))
+    for attr in ("subcategory_name", "category_name", "fullname"):
+        v = getattr(order, attr, None)
+        if isinstance(v, str) and v.strip():
+            out.add(_cat_norm(v))
+    return out
+
+
+def _acc_matches_category(acc, cat_candidates) -> bool:
+    """True if any of the account's bound category names matches the order.
+
+    Matching is substring-tolerant in one direction: the seller's entered
+    name only needs to be *contained* in one of the order's category
+    candidates. This lets a seller type a distinctive part of the full name
+    (e.g. "brawl stars") and still match the order's fullname
+    ("brawl stars, аккаунты"), while exact names match too.
+    """
+    cats = cat_candidates or set()
+    if not cats:
+        return False
+    for entry in acc.get("category_names", []):
+        e = _cat_norm(entry)
+        if e and any(e in cand for cand in cats):
+            return True
+    return False
+
+
+def _select_account_email(accs, lot_id, cat_candidates):
+    """Pick the mailbox for an order, honoring binding precedence.
+
+    Precedence (most specific first):
+      1. ``lot_ids``        — explicit per-lot binding
+      2. ``category_names`` — bind a whole FunPay category to a mailbox
+      3. wildcard           — account with NO lot_ids and NO category_names
+
+    Returns the account email or None if nothing matches.
+    """
+    lid = str(lot_id or "")
+    # Pass 1: explicit lot binding (most specific).
+    if lid:
+        for a in accs:
+            if lid in [str(x) for x in a.get("lot_ids", [])]:
+                return a.get("email")
+    # Pass 2: category binding.
+    for a in accs:
+        if _acc_matches_category(a, cat_candidates):
+            return a.get("email")
+    # Pass 3: wildcard (no lot and no category bindings).
+    for a in accs:
+        if not a.get("lot_ids") and not a.get("category_names"):
+            return a.get("email")
+    return None
 
 
 def _bid_norm(value) -> str | None:
@@ -1530,11 +1619,8 @@ def _startup_sales_scan(cardinal):
                             f"lot_name={lot_name!r:.120}, order_id={order_id}")
                     continue
 
-                acc_email = None
-                for a in accs:
-                    if lot_id in a.get("lot_ids", []) or not a.get("lot_ids"):
-                        acc_email = a["email"]
-                        break
+                acc_email = _select_account_email(
+                    accs, lot_id, _order_category_names(shortcut))
                 if not acc_email:
                     skipped += 1
                     skip_no_acc += 1
@@ -2046,13 +2132,12 @@ def on_new_order(c, e: NewOrderEvent):
     lot_id    = str(getattr(e.order, "lot_id", ""))
 
     accs      = accounts()
-    acc_email = None
-    for acc in accs:
-        if lot_id in acc.get("lot_ids", []) or not acc.get("lot_ids"):
-            acc_email = acc["email"]
-            break
+    cat_cands = _order_category_names(e.order)
+    acc_email = _select_account_email(accs, lot_id, cat_cands)
     if not acc_email:
-        logger.warning(f"AutoCode: нет аккаунта для лота {lot_id}")
+        logger.warning(
+            f"AutoCode: нет аккаунта для лота {lot_id} "
+            f"(категории: {sorted(cat_cands) or '—'})")
         return
 
     lang = get_buyer_lang(buyer, desc + " " + lot_name)
@@ -2636,7 +2721,7 @@ def init_autocode_tg(cardinal, *args):
         accs = accounts()
         accs.append({
             "email": email_addr, "password": "", "imap_host": auto_host,
-            "lot_ids": [], "code_type": "alnum", "code_len": 0,
+            "lot_ids": [], "category_names": [], "code_type": "alnum", "code_len": 0,
             "allow_spaces": False, "max_age_min": 60,
             "filter_from": "", "filter_subj": "", "filter_body": "",
         })
@@ -2671,6 +2756,7 @@ def init_autocode_tg(cardinal, *args):
         last   = h.get("last_check")
         l_str  = _fmt_time(last) if last else "—"
         lots   = acc.get("lot_ids", [])
+        cats   = acc.get("category_names", [])
         ctype  = acc.get("code_type", "alnum")
         clen   = acc.get("code_len", 0)
         ihost  = acc.get("imap_host") or detect_imap_host(acc["email"])
@@ -2682,6 +2768,7 @@ def init_autocode_tg(cardinal, *args):
             f"    проверено: {l_str}\n"
             f"🔌 IMAP: {ihost}\n"
             f"📦 Лоты: {', '.join(lots) if lots else 'все'}\n"
+            f"🏷 Категории: {', '.join(cats) if cats else '—'}\n"
             f"🔤 Тип кода: {CODE_TYPE_RU.get(ctype, ctype)}\n"
             f"🔢 Длина кода: {clen or 'авто'}\n"
             f"📬 От: {acc.get('filter_from') or '—'}\n"
@@ -2691,6 +2778,7 @@ def init_autocode_tg(cardinal, *args):
         kb = K(keyboard=[
             [B("🔌 IMAP хост",      callback_data=f"{AC_IMAP}:{idx}"),
              B("📦 Лоты",           callback_data=f"{AC_LOTS}:{idx}")],
+            [B("🏷 Категории",       callback_data=f"{AC_CATS}:{idx}")],
             [B(f"🔢 Длина: {clen or 'авто'}", callback_data=f"{AC_LEN}:{idx}"),
              B(f"🔤 {CODE_TYPE_RU.get(ctype, ctype)}", callback_data=f"{AC_TYPE}:{idx}")],
             [B("📬 От (from)",      callback_data=f"{AC_FROM}:{idx}"),
@@ -2718,6 +2806,30 @@ def init_autocode_tg(cardinal, *args):
         rows = [[B(f"🗑 {l}", callback_data=f"{AC_LOT_DEL}:{idx}:{l}")] for l in lots]
         rows.append([B("➕ Добавить лот", callback_data=f"{AC_LOT_ADD}:{idx}")])
         rows.append([B("◀ Назад",        callback_data=f"{AC_EDIT}:{idx}")])
+        return "\n".join(lines), K(keyboard=rows)
+
+    def _cats_card(idx):
+        """Build (text, keyboard) for the category-binding view."""
+        accs = accounts()
+        if idx >= len(accs):
+            return None, None
+        acc  = accs[idx]
+        cats = acc.get("category_names", [])
+        if cats:
+            lines = [f"🏷 Категории для {acc['email']}:"]
+            for i, c in enumerate(cats, 1):
+                lines.append(f"  {i}. {c}")
+        else:
+            lines = [f"🏷 Категории для {acc['email']}:\n  (нет привязок)"]
+        lines.append("\nЛюбой заказ из привязанной категории будет брать "
+                     "коды из этой почты. Приоритет: лоты → категории → "
+                     "почта без привязок.")
+        # Use the index in the list (not the name) in callback_data to keep it
+        # short and avoid issues with spaces/colons in category names.
+        rows = [[B(f"🗑 {c}", callback_data=f"{AC_CAT_DEL}:{idx}:{i}")]
+                for i, c in enumerate(cats)]
+        rows.append([B("➕ Добавить категорию", callback_data=f"{AC_CAT_ADD}:{idx}")])
+        rows.append([B("◀ Назад",             callback_data=f"{AC_EDIT}:{idx}")])
         return "\n".join(lines), K(keyboard=rows)
 
     def _send_acc_card(chat_id, idx, prefix=""):
@@ -2978,6 +3090,67 @@ def init_autocode_tg(cardinal, *args):
         if text:
             _safe_edit(bot, call, text, kb)
         _safe_answer(bot, call, f"🗑 Лот {lot} удалён.")
+
+    # ── category bindings ──
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_CATS}:"))
+    def open_cats(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        text, kb = _cats_card(idx)
+        if text is None:
+            _safe_answer(bot, call, "Аккаунт не найден.")
+            return
+        _safe_edit(bot, call, text, kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_CAT_ADD}:"))
+    def act_cat_add(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id,
+            "🏷 Введите название категории FunPay\n"
+            "(как на сайте, напр. «Brawl Stars, Аккаунты» — можно ввести "
+            "отличительную часть названия):")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _do_cat_add(m, _i))
+
+    def _do_cat_add(message: Message, idx: int):
+        accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
+        cat = (message.text or "").strip()
+        if not cat or cat in ("—", "-"):
+            bot.send_message(message.chat.id, "❌ Пустое название — отменено.")
+            return
+        cats = accs[idx].setdefault("category_names", [])
+        if any(_cat_norm(c) == _cat_norm(cat) for c in cats):
+            text, kb = _cats_card(idx)
+            bot.send_message(message.chat.id,
+                f"ℹ️ Категория «{cat}» уже привязана.\n\n{text}", reply_markup=kb)
+            return
+        cats.append(cat)
+        save_accs(accs)
+        text, kb = _cats_card(idx)
+        bot.send_message(message.chat.id,
+            f"✅ Категория «{cat}» добавлена.\n\n{text}", reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_CAT_DEL}:"))
+    def act_cat_del(call: CallbackQuery):
+        parts = call.data.split(":")
+        idx, pos = int(parts[1]), int(parts[2])
+        accs = accounts()
+        if idx >= len(accs):
+            _safe_answer(bot, call, "Аккаунт не найден.")
+            return
+        cats = accs[idx].get("category_names", [])
+        removed = ""
+        if 0 <= pos < len(cats):
+            removed = cats.pop(pos)
+            accs[idx]["category_names"] = cats
+            save_accs(accs)
+        text, kb = _cats_card(idx)
+        if text:
+            _safe_edit(bot, call, text, kb)
+        _safe_answer(bot, call, f"🗑 Категория удалена: {removed}" if removed
+                     else "Не найдено.")
 
     @bot.callback_query_handler(func=lambda c: c.data == AC_LOG)
     def open_log(call: CallbackQuery):

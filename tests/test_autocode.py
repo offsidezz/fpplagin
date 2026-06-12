@@ -632,3 +632,86 @@ def test_prune_used_codes_keeps_fresh_even_if_inactive():
     ac.save_used({"c@x.ru": [{"code": "CCC", "used_at": now - 60}]})  # fresh
     ac._prune_used_codes(now=now)
     assert [e["code"] for e in ac.used_codes()["c@x.ru"]] == ["CCC"]
+
+
+# ───────── category binding (bind mailbox by FunPay category name) ─────────
+
+import types as _t2
+
+
+def _order_with_subcat(fullname=None, name=None, parent=None, subcat_name=None):
+    """Build a fake order/shortcut exposing a subcategory object."""
+    sub = None
+    if fullname or name or parent:
+        cat = _t2.SimpleNamespace(name=parent) if parent else None
+        sub = _t2.SimpleNamespace(fullname=fullname, name=name, category=cat)
+    kwargs = {"subcategory": sub}
+    if subcat_name is not None:
+        kwargs["subcategory_name"] = subcat_name
+    return _t2.SimpleNamespace(**kwargs)
+
+
+def test_cat_norm_collapses_whitespace_and_case():
+    assert ac._cat_norm("  Brawl   Stars,  Аккаунты ") == "brawl stars, аккаунты"
+    assert ac._cat_norm(None) == ""
+
+
+def test_order_category_names_from_subcategory():
+    o = _order_with_subcat(fullname="Brawl Stars, Аккаунты",
+                           name="Аккаунты", parent="Brawl Stars")
+    cands = ac._order_category_names(o)
+    assert "brawl stars, аккаунты" in cands
+    assert "аккаунты" in cands
+    assert "brawl stars" in cands
+
+
+def test_order_category_names_string_fallback():
+    o = _order_with_subcat(subcat_name="Clash of Clans, Аккаунты")
+    assert "clash of clans, аккаунты" in ac._order_category_names(o)
+
+
+def test_order_category_names_empty_when_absent():
+    assert ac._order_category_names(_t2.SimpleNamespace()) == set()
+    assert ac._order_category_names(None) == set()
+
+
+def test_select_account_lot_id_takes_priority():
+    accs = [
+        {"email": "cat@x.ru", "category_names": ["Brawl Stars"]},
+        {"email": "lot@x.ru", "lot_ids": ["555"]},
+    ]
+    cands = ac._order_category_names(_order_with_subcat(fullname="Brawl Stars, Аккаунты"))
+    # lot binding wins even though the category also matches another account
+    assert ac._select_account_email(accs, "555", cands) == "lot@x.ru"
+
+
+def test_select_account_by_category_substring():
+    accs = [{"email": "bs@x.ru", "category_names": ["brawl stars"]}]
+    cands = ac._order_category_names(_order_with_subcat(fullname="Brawl Stars, Аккаунты"))
+    assert ac._select_account_email(accs, "999", cands) == "bs@x.ru"
+
+
+def test_select_account_category_no_false_match():
+    accs = [{"email": "coc@x.ru", "category_names": ["Clash of Clans"]}]
+    cands = ac._order_category_names(_order_with_subcat(fullname="Brawl Stars, Аккаунты"))
+    # no wildcard account → nothing matches
+    assert ac._select_account_email(accs, "999", cands) is None
+
+
+def test_select_account_wildcard_fallback():
+    accs = [
+        {"email": "spec@x.ru", "category_names": ["Clash of Clans"]},
+        {"email": "any@x.ru"},  # no lot_ids, no category_names → wildcard
+    ]
+    cands = ac._order_category_names(_order_with_subcat(fullname="Brawl Stars, Аккаунты"))
+    assert ac._select_account_email(accs, "999", cands) == "any@x.ru"
+
+
+def test_select_account_category_beats_wildcard():
+    accs = [
+        {"email": "any@x.ru"},  # wildcard
+        {"email": "bs@x.ru", "category_names": ["Brawl Stars"]},
+    ]
+    cands = ac._order_category_names(_order_with_subcat(fullname="Brawl Stars, Аккаунты"))
+    # category binding is more specific than wildcard, regardless of order
+    assert ac._select_account_email(accs, "999", cands) == "bs@x.ru"

@@ -36,7 +36,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.10.0"
+VERSION = "5.11.0"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code / код.\n"
@@ -103,6 +103,10 @@ AC_SRC           = "ac_src"         # toggle account source imap↔relay
 AC_SUP           = "ac_sup"         # set supplier nick (relay)
 AC_RELAY_TXT     = "ac_relay_txt"   # set relay request text
 AC_RELAY_RE      = "ac_relay_re"    # set relay code regex
+AC_RELAY_DIG     = "ac_relay_dig"   # set relay code digit count (4-8 / auto)
+AC_RELAY_STOP    = "ac_relay_stop"  # set relay out-of-stock phrases
+AC_RELAY_RESEND  = "ac_relay_rsnd"  # set relay auto-resend delay
+AC_RELAY_NUDGE   = "ac_relay_ndg"   # toggle relay review/confirm nudges
 
 CODE_TYPE_RU = {
     "alnum":      "буквы + цифры",
@@ -789,7 +793,7 @@ L_DEFAULTS = {
     "loyalty_bonus":    "🎁 Бонус за повторную покупку: +{days} дн!",
     "rental_activated":   "🌸 | Аренда активирована, команды для входа можешь узнать по команде !faq",
     "rental_renewed":     "✅ Аренда продлена на {h}ч!\nНовое время окончания: {t}",
-    "code_msg":           "🔑 Ваш код: {code}\n📅 Получен: {dt}",
+    "code_msg":           "🔑 Ваш код: {code}",
     "no_rental":          "❌ У вас нет активной аренды. Пожалуйста, оформите заказ.",
     "no_active":          "❌ У вас нет активной аренды.",
     "remaining":          "⏳ Осталось: {rem}\n📅 Окончание: {end}",
@@ -812,6 +816,7 @@ L_DEFAULTS = {
     "review_bonus_added": "🎁 Спасибо за отзыв! Аренда продлена на +{h}ч.\n📅 Новое окончание: {t}",
     "relay_wait":         "⏳ Запрашиваю код, секунду…",
     "relay_no_supplier":  "⚠️ Источник кода не настроен. Обратитесь к продавцу.",
+    "relay_out_of_stock": "⚠️ Кода сейчас нет в наличии. Мы уже уведомили продавца — он скоро решит вопрос.",
 }
 
 # Editable text keys shown in TG settings (display_name → L_DEFAULTS key)
@@ -836,6 +841,7 @@ _EDITABLE_TEXTS = {
     "Бонус за отзыв":         "review_bonus_added",
     "Релей: ожидание кода":   "relay_wait",
     "Релей: нет поставщика":  "relay_no_supplier",
+    "Релей: нет в наличии":   "relay_out_of_stock",
 }
 
 def t(key: str, **kwargs) -> str:
@@ -1428,6 +1434,54 @@ def _send_to_buyer(cardinal, rental: dict, text: str) -> bool:
 RELAY_WAIT_TIMEOUT_DEFAULT = 180
 RELAY_DEFAULT_REQUEST = "Здравствуйте! Нужен код для входа, пришлите пожалуйста."
 RELAY_DEFAULT_REGEX = r"(\d{4,8})"
+RELAY_DEFAULT_DIGITS = 0          # 0 / out-of-range = auto (RELAY_DEFAULT_REGEX)
+RELAY_RESEND_AFTER_DEFAULT = 0    # 0 = off (don't re-ping the supplier)
+# Phrases that mean "there is no code right now" → stop waiting, warn buyer+seller.
+RELAY_DEFAULT_STOP_PHRASES = [
+    "нет в налич", "нет кодов", "нет кода", "не осталось", "закончил",
+    "распродан", "недоступ", "нету", "out of stock", "sold out",
+]
+
+
+def _relay_digits(acc) -> int:
+    """Configured exact code length for a relay account (4..8), else 0=auto."""
+    try:
+        n = int(acc.get("relay_code_digits") or 0) if acc else 0
+    except (TypeError, ValueError):
+        n = 0
+    return n if 4 <= n <= 8 else 0
+
+
+def _relay_build_pattern(acc) -> str:
+    """Regex used to extract the code from a supplier reply.
+
+    Precedence: explicit ``relay_code_regex`` (advanced) → exact
+    ``relay_code_digits`` (4..8, anchored so we never grab part of a longer
+    number) → default ``RELAY_DEFAULT_REGEX``.
+    """
+    custom = (acc.get("relay_code_regex") if acc else None) or ""
+    if custom.strip():
+        return custom
+    n = _relay_digits(acc)
+    if n:
+        return r"(?<!\d)(\d{%d})(?!\d)" % n
+    return RELAY_DEFAULT_REGEX
+
+
+def _relay_stop_phrases(acc) -> list[str]:
+    """Out-of-stock phrases for a relay account. ``"-"`` disables detection."""
+    raw = (acc.get("relay_stop_phrases") if acc else None)
+    if raw is None or raw == "":
+        return list(RELAY_DEFAULT_STOP_PHRASES)
+    if str(raw).strip() == "-":
+        return []
+    parts = re.split(r"[,\n;]+", str(raw))
+    return [p.strip().lower() for p in parts if p.strip()]
+
+
+def _relay_text_has_stop(acc, text: str) -> bool:
+    low = (text or "").lower()
+    return any(p in low for p in _relay_stop_phrases(acc))
 
 # normalized supplier nick -> deque of pending requests
 _relay_pending: dict[str, deque] = {}
@@ -1472,11 +1526,14 @@ def _relay_resolve_supplier_chat(cardinal, supplier: str) -> str | None:
 
 
 def _deliver_code_payload(cardinal, code_val, *, acc_email, rental,
-                          chat_id, chat_name, author, order_id):
+                          chat_id, chat_name, author, order_id,
+                          skip_nudges=False, relay_notify=None):
     """Shared code-delivery: dedupe, log, send code, schedule review nudges.
 
     Used by both the IMAP path (``_on_result``) and the relay path so delivery
-    semantics stay identical.
+    semantics stay identical. ``skip_nudges`` lets a relay account opt out of
+    the review/confirm follow-ups; ``relay_notify`` (supplier nick) triggers a
+    TG heads-up so the seller sees every relayed code.
     """
     with _used_lock:
         u = used_codes()
@@ -1489,8 +1546,14 @@ def _deliver_code_payload(cardinal, code_val, *, acc_email, rental,
     msg = t("code_msg", code=code_val, dt=received_dt)
     Thread(target=cardinal.send_message, args=(chat_id, msg, chat_name), daemon=True).start()
 
-    _schedule_review_request(cardinal, chat_id, chat_name, buyer_name, order_id)
-    _schedule_order_confirm(cardinal, chat_id, chat_name, order_id)
+    if relay_notify:
+        _notify_tg(cardinal,
+                   f"✅ Relay: код {code_val} от {relay_notify} → покупателю "
+                   f"{buyer_name} (заказ #{order_id or '—'}).")
+
+    if not skip_nudges:
+        _schedule_review_request(cardinal, chat_id, chat_name, buyer_name, order_id)
+        _schedule_order_confirm(cardinal, chat_id, chat_name, order_id)
 
 
 def _relay_start_request(cardinal, rental, acc, author, chat_id, chat_name):
@@ -1512,6 +1575,19 @@ def _relay_start_request(cardinal, rental, acc, author, chat_id, chat_name):
                    f"(покупатель {author}).")
         return
 
+    # build the request text once (reused for an optional auto-resend)
+    req = acc.get("relay_request_text") or RELAY_DEFAULT_REQUEST
+    try:
+        req = req.format(lot_id=rental.get("lot_id", ""),
+                         order_id=rental.get("order_id", ""))
+    except Exception:
+        pass
+
+    try:
+        resend_after = int(acc.get("relay_resend_after") or RELAY_RESEND_AFTER_DEFAULT)
+    except (TypeError, ValueError):
+        resend_after = RELAY_RESEND_AFTER_DEFAULT
+
     skey = _relay_norm(supplier)
     pend = {
         "buyer_chat_id":   _cid_norm(chat_id),
@@ -1521,7 +1597,12 @@ def _relay_start_request(cardinal, rental, acc, author, chat_id, chat_name):
         "order_id":        rental.get("order_id", ""),
         "lot_id":          rental.get("lot_id", ""),
         "supplier":        supplier,
+        "supplier_chat":   supplier_chat,
+        "request_text":    req,
         "timeout":         int(acc.get("relay_timeout") or RELAY_WAIT_TIMEOUT_DEFAULT),
+        "resend_after":    resend_after,
+        "resent":          False,
+        "skip_nudges":     bool(acc.get("relay_skip_nudges")),
         "ts":              time.time(),
     }
     with _relay_lock:
@@ -1535,27 +1616,41 @@ def _relay_start_request(cardinal, rental, acc, author, chat_id, chat_name):
                 args=(chat_id, ack, chat_name), daemon=True).start()
 
     # ask the supplier (optionally referencing the lot/order)
-    req = acc.get("relay_request_text") or RELAY_DEFAULT_REQUEST
-    try:
-        req = req.format(lot_id=rental.get("lot_id", ""),
-                         order_id=rental.get("order_id", ""))
-    except Exception:
-        pass
     Thread(target=cardinal.send_message,
             args=(supplier_chat, req, supplier), daemon=True).start()
     logger.info(f"AutoCode relay: запрошен код у {supplier!r} (chat={supplier_chat}) "
                 f"для {pend['buyer_name']!r} (chat={pend['buyer_chat_id']})")
 
 
-def _relay_extract_code(pattern: str, text: str) -> str | None:
+def _relay_extract_code(pattern: str, text: str, exclude=None) -> str | None:
+    """Extract a code from ``text``. ``exclude`` is a set of values (e.g. the
+    order/lot id) that must NOT be treated as the code — protects against the
+    supplier echoing the order number instead of a real code."""
+    exclude = {str(x) for x in (exclude or set()) if x not in (None, "")}
     try:
-        m = re.search(pattern, text)
+        matches = list(re.finditer(pattern, text))
     except re.error as ex:
         logger.warning(f"AutoCode relay: bad regex {pattern!r}: {ex}")
-        m = re.search(RELAY_DEFAULT_REGEX, text)
-    if not m:
-        return None
-    return m.group(1) if m.groups() else m.group(0)
+        matches = list(re.finditer(RELAY_DEFAULT_REGEX, text))
+    for m in matches:
+        val = m.group(1) if m.groups() else m.group(0)
+        if val not in exclude:
+            return val
+    return None
+
+
+def _relay_pop_target(q, text: str):
+    """Pop the pending request the supplier reply refers to — matched by its
+    ``order_id``/``lot_id`` appearing as a whole token in ``text`` — else the
+    oldest pending (FIFO head). Keeps codes from going to the wrong buyer when
+    several share one supplier and the supplier answers out of order."""
+    for idx, it in enumerate(q):
+        for k in ("order_id", "lot_id"):
+            v = str(it.get(k) or "").strip()
+            if v and re.search(r"\b" + re.escape(v) + r"\b", text):
+                del q[idx]
+                return it
+    return q.popleft()
 
 
 def _relay_try_handle_supplier_reply(cardinal, e) -> bool:
@@ -1586,18 +1681,46 @@ def _relay_try_handle_supplier_reply(cardinal, e) -> bool:
         if not q:
             return False  # known supplier but nothing pending → ignore normally
 
-        head = q[0]
-        acc = next((a for a in accounts() if a.get("email") == head["acc_email"]), None)
-        pattern = (acc.get("relay_code_regex") if acc else None) or RELAY_DEFAULT_REGEX
-        code = _relay_extract_code(pattern, text)
+        acc = next((a for a in accounts() if a.get("email") == q[0]["acc_email"]), None)
+        pattern = _relay_build_pattern(acc)
+
+        # ids that must NOT be treated as the code (supplier may echo the order)
+        exclude_ids = set()
+        for it in q:
+            for k in ("order_id", "lot_id"):
+                v = str(it.get(k) or "").strip()
+                if v:
+                    exclude_ids.add(v)
+
+        code = _relay_extract_code(pattern, text, exclude=exclude_ids)
+
         if not code:
+            # "no code right now" → stop waiting on the matched buyer, warn both
+            if _relay_text_has_stop(acc, text):
+                with _relay_lock:
+                    q = _relay_pending.get(skey)
+                    if not q:
+                        return True
+                    pend = _relay_pop_target(q, text)
+                    if not q:
+                        _relay_pending.pop(skey, None)
+                Thread(target=cardinal.send_message,
+                        args=(pend["buyer_chat_id"], t("relay_out_of_stock"),
+                              pend["buyer_chat_name"]), daemon=True).start()
+                _notify_tg(cardinal,
+                           f"⚠️ Relay: поставщик {pend['supplier']} сообщил, что кода "
+                           f"нет в наличии (покупатель {pend['buyer_name']}, "
+                           f"заказ #{pend.get('order_id') or '—'}).")
+                logger.info(f"AutoCode relay: {pend['supplier']!r} — нет кода для "
+                            f"{pend['buyer_name']!r}")
+                return True
             return True  # supplier wrote something that isn't a code → keep waiting
 
         with _relay_lock:
             q = _relay_pending.get(skey)
             if not q:
                 return True
-            pend = q.popleft()
+            pend = _relay_pop_target(q, text)
             if not q:
                 _relay_pending.pop(skey, None)
 
@@ -1607,6 +1730,8 @@ def _relay_try_handle_supplier_reply(cardinal, e) -> bool:
             acc_email=pend["acc_email"], rental=rental_min,
             chat_id=pend["buyer_chat_id"], chat_name=pend["buyer_chat_name"],
             author=pend["buyer_name"], order_id=pend.get("order_id", ""),
+            skip_nudges=pend.get("skip_nudges", False),
+            relay_notify=pend.get("supplier"),
         )
         logger.info(f"AutoCode relay: код {code!r} от {pend['supplier']!r} доставлен "
                     f"покупателю {pend['buyer_name']!r}")
@@ -1629,6 +1754,7 @@ def _start_relay_worker(cardinal):
             time.sleep(5)
             now = time.time()
             expired = []
+            resend = []
             with _relay_lock:
                 for skey, q in list(_relay_pending.items()):
                     keep = deque()
@@ -1636,12 +1762,24 @@ def _start_relay_worker(cardinal):
                         to = it.get("timeout", RELAY_WAIT_TIMEOUT_DEFAULT)
                         if now - it["ts"] > to:
                             expired.append(it)
-                        else:
-                            keep.append(it)
+                            continue
+                        ra = it.get("resend_after", 0) or 0
+                        if (ra and not it.get("resent")
+                                and now - it["ts"] > ra and it.get("supplier_chat")):
+                            it["resent"] = True
+                            resend.append(it)
+                        keep.append(it)
                     if keep:
                         _relay_pending[skey] = keep
                     else:
                         _relay_pending.pop(skey, None)
+            for it in resend:
+                Thread(target=cardinal.send_message,
+                        args=(it["supplier_chat"], it.get("request_text")
+                              or RELAY_DEFAULT_REQUEST, it["supplier"]),
+                        daemon=True).start()
+                logger.info(f"AutoCode relay: повторный запрос кода у {it['supplier']!r} "
+                            f"для {it['buyer_name']!r}")
             for it in expired:
                 Thread(target=cardinal.send_message,
                         args=(it["buyer_chat_id"], t("code_not_found"),
@@ -3028,6 +3166,9 @@ def init_autocode_tg(cardinal, *args):
             "password": "", "imap_host": "",
             "lot_ids": [], "category_names": [],
             "relay_request_text": "", "relay_code_regex": "",
+            "relay_code_digits": RELAY_DEFAULT_DIGITS,
+            "relay_stop_phrases": "", "relay_resend_after": RELAY_RESEND_AFTER_DEFAULT,
+            "relay_skip_nudges": False,
             "relay_timeout": RELAY_WAIT_TIMEOUT_DEFAULT,
         })
         save_accs(accs)
@@ -3115,6 +3256,102 @@ def init_autocode_tg(cardinal, *args):
         save_accs(accs)
         _send_acc_card(message.chat.id, idx, prefix="✅ Regex сохранён.")
 
+    # ── set relay code digit count (4-8 / auto) ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RELAY_DIG}:"))
+    def set_relay_dig(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id,
+            "Сколько цифр в коде? Введите число 4, 5, 6, 7 или 8.\n"
+            "Бот возьмёт из сообщения поставщика ровно столько идущих подряд цифр.\n"
+            "Введите 0 или «-» — авто (любое число 4–8 цифр).")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _save_relay_dig(m, _i))
+
+    def _save_relay_dig(message: Message, idx: int):
+        accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
+        val = message.text.strip()
+        if val in ("-", "0", ""):
+            n = 0
+        else:
+            try:
+                n = int(val)
+            except ValueError:
+                bot.send_message(message.chat.id, "❌ Введите число 4–8 (или 0/«-» для авто).")
+                return
+            if not (4 <= n <= 8):
+                bot.send_message(message.chat.id, "❌ Допустимо 4, 5, 6, 7 или 8 (или 0/«-» для авто).")
+                return
+        accs[idx]["relay_code_digits"] = n
+        save_accs(accs)
+        _send_acc_card(message.chat.id, idx,
+            prefix=f"✅ Длина кода: {'авто' if not n else str(n) + ' цифр'}.")
+
+    # ── set relay out-of-stock phrases ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RELAY_STOP}:"))
+    def set_relay_stop(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id,
+            "Фразы поставщика, означающие «кода нет в наличии» (через запятую).\n"
+            "Если поставщик так ответит — покупателю уйдёт уведомление, а вам "
+            "придёт сигнал в Telegram.\n"
+            f"По умолчанию: {', '.join(RELAY_DEFAULT_STOP_PHRASES)}\n"
+            "Введите «-», чтобы отключить детекцию.")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _save_relay_stop(m, _i))
+
+    def _save_relay_stop(message: Message, idx: int):
+        accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
+        accs[idx]["relay_stop_phrases"] = message.text.strip()
+        save_accs(accs)
+        _send_acc_card(message.chat.id, idx, prefix="✅ Стоп-фразы сохранены.")
+
+    # ── set relay auto-resend delay ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RELAY_RESEND}:"))
+    def set_relay_resend(call: CallbackQuery):
+        idx = int(call.data.split(":")[1])
+        msg = bot.send_message(call.message.chat.id,
+            "Через сколько секунд повторно пнуть поставщика, если он молчит?\n"
+            "Например 90. Введите 0 — не напоминать (по умолчанию).")
+        bot.register_next_step_handler(msg, lambda m, _i=idx: _save_relay_resend(m, _i))
+
+    def _save_relay_resend(message: Message, idx: int):
+        accs = accounts()
+        if idx >= len(accs):
+            bot.send_message(message.chat.id, "❌ Аккаунт не найден.")
+            return
+        val = message.text.strip()
+        try:
+            sec = max(0, int(val))
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ Введите число секунд (0 — выкл).")
+            return
+        accs[idx]["relay_resend_after"] = sec
+        save_accs(accs)
+        _send_acc_card(message.chat.id, idx,
+            prefix=("✅ Авто-напоминание выключено." if not sec
+                    else f"✅ Повторный запрос через {sec}с."))
+
+    # ── toggle relay review/confirm nudges ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{AC_RELAY_NUDGE}:"))
+    def toggle_relay_nudge(call: CallbackQuery):
+        idx  = int(call.data.split(":")[1])
+        accs = accounts()
+        if idx >= len(accs):
+            _safe_answer(bot, call, "Аккаунт не найден.", show_alert=True)
+            return
+        accs[idx]["relay_skip_nudges"] = not bool(accs[idx].get("relay_skip_nudges"))
+        save_accs(accs)
+        _safe_answer(bot, call,
+            "Напоминания об отзыве выключены." if accs[idx]["relay_skip_nudges"]
+            else "Напоминания об отзыве включены.")
+        text, kb = _acc_card(idx)
+        if text:
+            _safe_edit(bot, call, text, kb)
+
     # ── helpers: build account card & lots card ──
 
     def _acc_card(idx):
@@ -3128,6 +3365,10 @@ def init_autocode_tg(cardinal, *args):
         if _is_relay(acc):
             lots = acc.get("lot_ids", [])
             cats = acc.get("category_names", [])
+            _dig = _relay_digits(acc)
+            _resend = acc.get("relay_resend_after") or RELAY_RESEND_AFTER_DEFAULT
+            _stops = _relay_stop_phrases(acc)
+            _nudge_off = bool(acc.get("relay_skip_nudges"))
             rtext = (
                 f"🔗 {acc['email']}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -3136,7 +3377,11 @@ def init_autocode_tg(cardinal, *args):
                 f"📦 Лоты: {', '.join(lots) if lots else 'все'}\n"
                 f"🏷 Категории: {', '.join(cats) if cats else '—'}\n"
                 f"📨 Запрос: {acc.get('relay_request_text') or RELAY_DEFAULT_REQUEST}\n"
-                f"🔎 Regex кода: {acc.get('relay_code_regex') or RELAY_DEFAULT_REGEX}\n"
+                f"🔢 Длина кода: {'авто (4–8)' if not _dig else str(_dig) + ' цифр'}\n"
+                f"🔎 Regex кода: {acc.get('relay_code_regex') or '— (по длине/авто)'}\n"
+                f"🚫 Нет в наличии: {'выкл' if not _stops else str(len(_stops)) + ' фраз'}\n"
+                f"🔁 Авто-напоминание: {'выкл' if not _resend else str(_resend) + 'с'}\n"
+                f"⭐ Отзыв/подтверждение: {'выкл' if _nudge_off else 'вкл'}\n"
                 f"⏱ Таймаут: {acc.get('relay_timeout') or RELAY_WAIT_TIMEOUT_DEFAULT}с"
             )
             rkb = K(keyboard=[
@@ -3145,7 +3390,12 @@ def init_autocode_tg(cardinal, *args):
                  B("📦 Лоты", callback_data=f"{AC_LOTS}:{idx}")],
                 [B("🏷 Категории", callback_data=f"{AC_CATS}:{idx}")],
                 [B("📨 Текст запроса", callback_data=f"{AC_RELAY_TXT}:{idx}"),
-                 B("🔎 Regex", callback_data=f"{AC_RELAY_RE}:{idx}")],
+                 B("🔢 Длина кода", callback_data=f"{AC_RELAY_DIG}:{idx}")],
+                [B("🔎 Regex", callback_data=f"{AC_RELAY_RE}:{idx}"),
+                 B("🚫 Нет в наличии", callback_data=f"{AC_RELAY_STOP}:{idx}")],
+                [B("🔁 Авто-напоминание", callback_data=f"{AC_RELAY_RESEND}:{idx}"),
+                 B(f"⭐ Отзыв: {'выкл' if _nudge_off else 'вкл'}",
+                   callback_data=f"{AC_RELAY_NUDGE}:{idx}")],
                 [B("🗑 Удалить", callback_data=f"{AC_DEL_ASK}:{idx}")],
                 [B("◀ Назад", callback_data=f"{AC_LIST}:0")],
             ])

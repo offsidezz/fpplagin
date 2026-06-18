@@ -36,7 +36,7 @@ from telebot.types import (
 )
 
 NAME = "AutoCode"
-VERSION = "5.9.0"
+VERSION = "5.9.1"
 UUID = str(uuid_lib.UUID("b7e21f3a-4c8d-4e2b-9a1f-3c5d6e7f8b9a"))
 DESCRIPTION = (
     "Авто-выдача кодов с IMAP-почт по команде !cd / code / код.\n"
@@ -655,6 +655,26 @@ def _rentals_flush_worker():
             time.sleep(1)
         _flush_rentals()
     _flush_rentals()                      # final flush on shutdown
+
+def mutate_rentals(fn):
+    """Atomically read-modify-write the live rentals cache.
+
+    ``fn(rents)`` receives the live cache dict and mutates it in place; the
+    change is flushed on the next interval (and on shutdown). This is the
+    race-free alternative to the ``rentals()`` -> mutate snapshot ->
+    ``save_rentals()`` pattern, where two interleaved writers could read the
+    same snapshot and the second save would clobber the first writer's change.
+    Serializes under the shared ``_rentals_lock`` (top-level), nesting the
+    cache lock in the same order every other writer uses. Returns fn's result.
+    """
+    global _rentals_dirty
+    with _rentals_lock:
+        with _rentals_cache_lock:
+            rents = _rentals_cache_get()
+            result = fn(rents)
+            _rentals_dirty = True
+    return result
+
 def templates():           return _load(TEMPLATES_FILE, [])
 def save_templates(d):     _save(TEMPLATES_FILE, d)
 def bcast_history():       return _load(BCAST_HIST_FILE, [])
@@ -665,15 +685,41 @@ def health_state():        return _load(HEALTH_FILE, {})
 def save_health(d):        _save(HEALTH_FILE, d)
 def lang_cache():          return _load(LANG_CACHE_FILE, {})
 def save_lang_cache(d):    _save(LANG_CACHE_FILE, d)
-def app_settings():        return _load(SETTINGS_FILE, {
+_SETTINGS_DEFAULTS = {
     "review_enabled":   True,
     "review_template":  "Если код подошёл — буду благодарен за отзыв 🙏 Это очень помогает!",
     "confirm_enabled":  True,
     "queue_pause_sec":  2,
     "faq_custom_ru":      "",
     "texts":              {},
-})
-def save_settings(d):      _save(SETTINGS_FILE, d)
+}
+
+# ── Settings: in-memory cache ───────────────────────────────────────────────
+# app_settings() is on the hot path: t() reads it on every message, and the
+# IMAP queue worker reads queue_pause_sec each iteration. Re-reading +
+# json-parsing (and decrypting, were it encrypted) the file every time is pure
+# waste — the file only changes from save_settings(). Cache it in memory and
+# invalidate on write. Callers get a deepcopy so mutating the returned dict
+# never corrupts the cache.
+_settings_cache: dict | None = None
+_settings_lock = Lock()
+
+def app_settings():
+    global _settings_cache
+    with _settings_lock:
+        if _settings_cache is None:
+            loaded = _load(SETTINGS_FILE, {})
+            merged = dict(_SETTINGS_DEFAULTS)
+            if isinstance(loaded, dict):
+                merged.update(loaded)
+            _settings_cache = merged
+        return copy.deepcopy(_settings_cache)
+
+def save_settings(d):
+    global _settings_cache
+    with _settings_lock:
+        _settings_cache = copy.deepcopy(d)
+    _save(SETTINGS_FILE, d)
 
 
 # ── Bonus hours for review ──
@@ -945,7 +991,7 @@ def _find_code(plain, html, subj, acc) -> str | None:
             return m.group()
     return None
 
-def fetch_code(acc, used, not_before_ts=None, dry_run=False) -> tuple[str | None, str | None]:
+def fetch_code(acc, used, dry_run=False) -> tuple[str | None, str | None]:
     email_addr  = acc.get("email", "")
     password    = _decrypt_password(acc.get("password", ""))
     imap_host   = acc.get("imap_host") or detect_imap_host(email_addr)
@@ -978,33 +1024,51 @@ def fetch_code(acc, used, not_before_ts=None, dry_run=False) -> tuple[str | None
         if status != "OK":
             return None, f"INBOX недоступен: статус {status}"
 
-        if filter_from:
-            _, data = mail.search(None, "FROM", filter_from)
-        else:
-            _, data = mail.search(None, "ALL")
-
-        msg_ids = data[0].split()
-        if not msg_ids:
-            return None, "Входящих писем нет."
-
-        # FIX: Strict max_age_min window — only look at recent emails.
-        # Previously widened by not_before_ts which made max_age meaningless.
+        # FIX (perf): push the date window to the server with SINCE so the
+        # mailbox returns only recent messages instead of scanning the whole
+        # INBOX. SINCE is date-granular and inclusive, so we widen by one day
+        # and still apply the precise max_age cutoff client-side below.
         cutoff = time.time() - max_age * 60
+        since_date = time.strftime("%d-%b-%Y", time.gmtime(cutoff - 86400))
+        criteria = ["SINCE", since_date]
+        if filter_from:
+            criteria += ["FROM", filter_from]
+        try:
+            _, data = mail.search(None, *criteria)
+        except Exception:
+            # Some servers dislike combined/ranged criteria — degrade safely.
+            _, data = (mail.search(None, "FROM", filter_from)
+                       if filter_from else mail.search(None, "ALL"))
+
+        msg_ids = data[0].split() if (data and data[0]) else []
+        if not msg_ids:
+            return None, "Подходящих писем нет."
 
         for mid in reversed(msg_ids[-50:]):
             try:
-                _, raw = mail.fetch(mid, "(RFC822)")
-                msg = email.message_from_bytes(raw[0][1])
-                date_str = msg.get("Date", "")
+                # FIX (perf): fetch headers first (BODY.PEEK keeps the message
+                # UNREAD — plain RFC822 set the \\Seen flag) and only download
+                # the full body for messages that pass the date/subject
+                # filters. Cuts IMAP traffic and latency sharply on big boxes.
+                _, hdr = mail.fetch(
+                    mid, "(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM)])")
+                if not hdr or not isinstance(hdr[0], tuple) or not hdr[0][1]:
+                    continue
+                hmsg = email.message_from_bytes(hdr[0][1])
                 try:
-                    msg_ts = parsedate_to_datetime(date_str).timestamp()
+                    msg_ts = parsedate_to_datetime(hmsg.get("Date", "")).timestamp()
                 except Exception:
                     continue
                 if msg_ts < cutoff:
                     continue
-                subj = _decode_str(msg.get("Subject", ""))
+                subj = _decode_str(hmsg.get("Subject", ""))
                 if filter_subj and filter_subj.lower() not in subj.lower():
                     continue
+
+                _, raw = mail.fetch(mid, "(BODY.PEEK[])")
+                if not raw or not isinstance(raw[0], tuple) or not raw[0][1]:
+                    continue
+                msg = email.message_from_bytes(raw[0][1])
                 plain, html = _get_text(msg)
                 code = _find_code(plain, html, subj, acc)
                 if code and (dry_run or code not in used_set):
@@ -1147,6 +1211,14 @@ _rentals_lock = Lock()
 def _check_rate(buyer: str) -> tuple[bool, str]:
     with _rate_lock:
         now = time.time()
+        # FIX (memory leak): sweep buyers with no recent activity so the
+        # rate-limit maps don't grow unbounded over long uptime. Entries older
+        # than an hour can never affect a decision (CODE_CD < 1h, hour window).
+        if len(_last_code_ts) > 512:
+            for _b in [b for b, ts in list(_last_code_ts.items())
+                       if now - ts > 3600]:
+                _last_code_ts.pop(_b, None)
+                _code_requests.pop(_b, None)
         last = _last_code_ts.get(buyer, 0)
         if now - last < CODE_CD:
             wait = int(CODE_CD - (now - last))
@@ -2332,11 +2404,20 @@ def on_new_message(c, e: NewMessageEvent):
     is_seller   = bool(author_id) and author_id == seller_id
 
     def _heal(k, reason):
-        """Stamp the real incoming chat_id onto a matched rental and persist."""
+        """Stamp the real incoming chat_id onto a matched rental and persist.
+
+        Writes go straight to the live cache via mutate_rentals (atomic) so a
+        concurrent handler working off its own snapshot can't clobber the heal;
+        the local snapshot is updated too for the immediate send that follows.
+        """
         old_cid = rents[k].get("chat_id")
         rents[k]["chat_id"]   = cid_norm
         rents[k]["chat_name"] = chat_name
-        save_rentals(rents)
+        def _apply(live, _k=k, _cid=cid_norm, _cn=chat_name):
+            if _k in live:
+                live[_k]["chat_id"]   = _cid
+                live[_k]["chat_name"] = _cn
+        mutate_rentals(_apply)
         logger.info(f"AutoCode: healed chat_id for rental {k} via {reason} "
                     f"(buyer={rents[k].get('buyer')}, {old_cid} → {cid_norm})")
         return [rents[k]]
@@ -2414,17 +2495,11 @@ def on_new_message(c, e: NewMessageEvent):
 
         return []
 
-    # Update chat_id on rentals by buyer name if not set
-    rents_changed = False
-    for k, r in rents.items():
-        if _name_norm(r.get("buyer")) == author_norm and author_norm \
-           and _safe_ts(r.get("expires_at", 0)) > now:
-            if not r.get("chat_id"):
-                rents[k]["chat_id"]   = cid_norm
-                rents[k]["chat_name"] = chat_name
-                rents_changed = True
-    if rents_changed:
-        save_rentals(rents)
+    # NOTE: eager "heal chat_id by buyer name on every message" was removed —
+    # it duplicated tier-2/tier-3 of _find_active_rentals_for_chat (which heal
+    # lazily on the first lookup that needs the chat), did a full snapshot
+    # write on benign chatter, and was an unlocked race. Healing now happens
+    # atomically via _heal()/mutate_rentals when a command actually needs it.
 
     # ── Auto-extend on review: lots tagged "+Nч за отзыв" grant bonus hours
     #    the first time the buyer leaves a review in this chat. ──
@@ -2445,14 +2520,24 @@ def on_new_message(c, e: NewMessageEvent):
                 _oids = [r.get("order_id"), *[x for x in r.get("order_ids", [])]]
                 if not any(_order_review_exists(c, o) for o in _oids if o):
                     continue
-            r["expires_at"] = _safe_ts(r.get("expires_at", 0)) + bonus * 3600
-            r["hours"]      = int(r.get("hours", 0) or 0) + bonus
+            new_exp = _safe_ts(r.get("expires_at", 0)) + bonus * 3600
+            rkey = r.get("order_key") or r.get("order_id")
+            # Atomic write to the live cache (idempotency is guarded by the
+            # review_bonus_given flag, re-checked inside the mutation).
+            def _grant(live, _k=rkey, _b=bonus, _e=new_exp):
+                rr = live.get(_k)
+                if not rr or rr.get("review_bonus_given"):
+                    return
+                rr["expires_at"]        = _e
+                rr["hours"]             = int(rr.get("hours", 0) or 0) + _b
+                rr["review_bonus_given"] = True
+            mutate_rentals(_grant)
+            r["expires_at"]         = new_exp
             r["review_bonus_given"] = True
-            save_rentals(rents)
             Thread(
                 target=c.send_message,
                 args=(chat_id,
-                      t("review_bonus_added", h=bonus, t=_fmt_time(r["expires_at"])),
+                      t("review_bonus_added", h=bonus, t=_fmt_time(new_exp)),
                       chat_name),
                 daemon=True,
             ).start()
@@ -2494,6 +2579,12 @@ def on_new_message(c, e: NewMessageEvent):
     # ── Problem detection → notify seller in TG ──
     if not _is_command_message(text) and any(kw in lower for kw in _PROBLEM_KEYWORDS):
         now_p = time.time()
+        # FIX (memory leak): drop stale cooldown entries before adding a new one
+        # so this map can't grow unbounded across many one-off buyers.
+        if len(_PROBLEM_COOLDOWN) > 512:
+            for _b in [b for b, ts in list(_PROBLEM_COOLDOWN.items())
+                       if now_p - ts > _PROBLEM_COOLDOWN_SEC]:
+                _PROBLEM_COOLDOWN.pop(_b, None)
         last_notify = _PROBLEM_COOLDOWN.get(author, 0)
         if now_p - last_notify > _PROBLEM_COOLDOWN_SEC:
             _PROBLEM_COOLDOWN[author] = now_p
@@ -2578,7 +2669,6 @@ def on_new_message(c, e: NewMessageEvent):
         ).start()
 
     used = used_codes()
-    not_before_ts = _safe_ts(rental.get("purchase_ts", 0))
 
     def _on_result(result):
         code_val, err = result
@@ -2609,7 +2699,7 @@ def on_new_message(c, e: NewMessageEvent):
         # exists — then only the code above was sent).
         _schedule_order_confirm(c, chat_id, chat_name, order_id)
 
-    _imap_queue.submit(acc_email, fetch_code, _on_result, acc, used, not_before_ts=not_before_ts)
+    _imap_queue.submit(acc_email, fetch_code, _on_result, acc, used)
 
 
 

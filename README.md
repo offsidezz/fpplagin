@@ -5,6 +5,7 @@
 стакание продлений, авто-бонусы за отзыв и учёт возвратов.
 
 Единый файл — `autocode.py` (Cardinal-плагин). Текущая версия — см. `VERSION` в начале файла.
+История изменений — [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -98,7 +99,9 @@ uv run --with pytest python -m pytest tests/ -v
 ```
 
 Тесты изолируют хранилище во временную папку и заглушают хост-модули
-(FunPayAPI / telebot / tg_bot) — см. `tests/conftest.py`.
+(FunPayAPI / telebot / tg_bot) — см. `tests/conftest.py`. Покрытие включает
+гонки/конкурентность аренд (`mutate_rentals`), кэш настроек, выметание
+rate-limit и IMAP-выборку (`SINCE` + `BODY.PEEK` + префетч заголовков).
 
 ---
 
